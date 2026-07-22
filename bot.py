@@ -271,7 +271,7 @@ def is_in_selected_regions(lat: float, lon: float, selected_keys: Set[str], all_
             return True
     return False
 
-# ==================== ЗАГРУЗЧИК БАЗЫ ICAO (С ПОДДЕРЖКОЙ GOOGLE DRIVE) ====================
+# ==================== ЗАГРУЗЧИК БАЗЫ ICAO ====================
 class AircraftDatabase:
     def __init__(self):
         self.data: Dict[str, Dict[str, str]] = {}
@@ -734,6 +734,10 @@ async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if context.job_queue is None:
+        await update.message.reply_text("❌ Ошибка: JobQueue не установлена. Установите зависимость python-telegram-bot[job-queue].")
+        return
+
     jobs = context.job_queue.get_jobs_by_name(str(chat_id))
     if jobs:
         await update.message.reply_text("⚠️ Мониторинг уже активен.")
@@ -755,6 +759,9 @@ async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stop_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if context.job_queue is None:
+        await update.message.reply_text("❌ Ошибка: JobQueue не установлена.")
+        return
     jobs = context.job_queue.get_jobs_by_name(str(chat_id))
     if not jobs:
         await update.message.reply_text("ℹ️ Мониторинг не активен.")
@@ -769,7 +776,9 @@ async def stop_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    is_active = any(job.name == str(chat_id) for job in context.job_queue.jobs())
+    is_active = False
+    if context.job_queue:
+        is_active = any(job.name == str(chat_id) for job in context.job_queue.jobs())
     status_text = "активен" if is_active else "не активен"
     selected = UserPreferences.get_regions(user_id)
     all_regions = get_all_regions_for_user(user_id)
@@ -800,31 +809,30 @@ async def region_management_menu(update: Update, context: ContextTypes.DEFAULT_T
         reply_markup=get_region_management_keyboard()
     )
 
-# ==================== ВЫБОР РАЙОНОВ (INLINE) — ИСПРАВЛЕННЫЙ ====================
+# ==================== ВЫБОР РАЙОНОВ (ИСПРАВЛЕННЫЙ) ====================
 async def regions_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    await update.message.reply_text(
+        "🗺 Выберите районы для отслеживания:\n"
+        "Нажмите на кнопку, чтобы включить/выключить.",
+        reply_markup=await get_region_keyboard(user_id)
+    )
+
+async def get_region_keyboard(user_id: int) -> InlineKeyboardMarkup:
     selected = UserPreferences.get_regions(user_id)
     all_regions = get_all_regions_for_user(user_id)
-
     keyboard = []
     for key, region in all_regions.items():
         status = "✅" if key in selected else "⬜"
         button_text = f"{status} {region['name']}"
         callback_data = f"region_toggle_{key}"
         keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
-
     keyboard.append([
         InlineKeyboardButton("✅ Выбрать все", callback_data="region_select_all"),
         InlineKeyboardButton("⬜ Сбросить все", callback_data="region_deselect_all")
     ])
     keyboard.append([InlineKeyboardButton("◀️ Назад в управление районами", callback_data="region_back_to_management")])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "🗺 Выберите районы для отслеживания:\n"
-        "Нажмите на кнопку, чтобы включить/выключить.",
-        reply_markup=reply_markup
-    )
+    return InlineKeyboardMarkup(keyboard)
 
 async def regions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -837,64 +845,37 @@ async def regions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Управление районами", reply_markup=get_region_management_keyboard())
         return
 
+    selected = UserPreferences.get_regions(user_id)
+    new_selected = selected.copy()
+
     if data == "region_select_all":
         all_regions = get_all_regions_for_user(user_id)
         new_selected = set(all_regions.keys())
-        old_selected = UserPreferences.get_regions(user_id)
-        if new_selected != old_selected:
-            UserPreferences.set_regions(user_id, new_selected)
-            await regions_menu_edit(user_id, query.message)
-        else:
-            await query.answer("✅ Уже выбраны все районы.")
-        return
-
-    if data == "region_deselect_all":
-        old_selected = UserPreferences.get_regions(user_id)
-        if old_selected:
-            UserPreferences.set_regions(user_id, set())
-            await regions_menu_edit(user_id, query.message)
-        else:
-            await query.answer("⬜ Все районы уже сброшены.")
-        return
-
-    if data.startswith("region_toggle_"):
+    elif data == "region_deselect_all":
+        new_selected = set()
+    elif data.startswith("region_toggle_"):
         key = data.split("_")[2]
-        old_selected = UserPreferences.get_regions(user_id)
-        new_selected = old_selected.copy()
         if key in new_selected:
             new_selected.remove(key)
         else:
             new_selected.add(key)
-        if new_selected != old_selected:
-            UserPreferences.set_regions(user_id, new_selected)
-            await regions_menu_edit(user_id, query.message)
+    else:
+        return
+
+    if new_selected != selected:
+        UserPreferences.set_regions(user_id, new_selected)
+        try:
+            await query.message.edit_reply_markup(reply_markup=await get_region_keyboard(user_id))
+        except Exception as e:
+            if "Message is not modified" not in str(e):
+                logger.error(f"Ошибка обновления клавиатуры: {e}")
+    else:
+        if data == "region_select_all":
+            await query.answer("Уже выбраны все районы.")
+        elif data == "region_deselect_all":
+            await query.answer("Все районы уже сброшены.")
         else:
             await query.answer("Ничего не изменилось.")
-
-async def regions_menu_edit(user_id: int, message):
-    selected = UserPreferences.get_regions(user_id)
-    all_regions = get_all_regions_for_user(user_id)
-    keyboard = []
-    for key, region in all_regions.items():
-        status = "✅" if key in selected else "⬜"
-        button_text = f"{status} {region['name']}"
-        callback_data = f"region_toggle_{key}"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
-    keyboard.append([
-        InlineKeyboardButton("✅ Выбрать все", callback_data="region_select_all"),
-        InlineKeyboardButton("⬜ Сбросить все", callback_data="region_deselect_all")
-    ])
-    keyboard.append([InlineKeyboardButton("◀️ Назад в управление районами", callback_data="region_back_to_management")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    try:
-        await message.edit_text(
-            "🗺 Выберите районы для отслеживания:\n"
-            "Нажмите на кнопку, чтобы включить/выключить.",
-            reply_markup=reply_markup
-        )
-    except Exception as e:
-        if "Message is not modified" not in str(e):
-            logger.error(f"Ошибка при редактировании сообщения: {e}")
 
 # ==================== СОЗДАНИЕ РАЙОНА ====================
 async def create_region_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1078,17 +1059,18 @@ async def set_interval_receive(update: Update, context: ContextTypes.DEFAULT_TYP
         config = ConfigManager.load()
         config["interval_seconds"] = val
         ConfigManager.save(config)
-        for chat_id in list(tracker.active_chats):
-            jobs = context.job_queue.get_jobs_by_name(str(chat_id))
-            for job in jobs:
-                job.schedule_removal()
-            context.job_queue.run_repeating(
-                tracker.monitor,
-                interval=timedelta(seconds=val),
-                first=5,
-                chat_id=chat_id,
-                name=str(chat_id)
-            )
+        if context.job_queue:
+            for chat_id in list(tracker.active_chats):
+                jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+                for job in jobs:
+                    job.schedule_removal()
+                context.job_queue.run_repeating(
+                    tracker.monitor,
+                    interval=timedelta(seconds=val),
+                    first=5,
+                    chat_id=chat_id,
+                    name=str(chat_id)
+                )
         await update.message.reply_text(f"✅ Интервал установлен в {val} секунд.", reply_markup=get_settings_keyboard())
     except ValueError:
         await update.message.reply_text("❌ Введите целое число.")
@@ -1352,7 +1334,11 @@ async def main_async():
 
     tracker = AircraftTracker(db)
 
+    # Создаём приложение с JobQueue
     app = Application.builder().token(BOT_TOKEN).build()
+    # В версии 20+ Application автоматически создаёт JobQueue, но для надёжности проверим
+    # Если всё равно None, можно явно добавить: app.job_queue = JobQueue(app)
+    # Но он должен создаться автоматически, если установлен python-telegram-bot[job-queue]
 
     # Команды
     app.add_handler(CommandHandler("start", start))

@@ -21,8 +21,8 @@ class Config:
     DATABASE_URL = "https://drive.google.com/uc?export=download&id=1sS8a5AZdiXMze8f08iNnVL7kTnlRuarl"
     FALLBACK_DATABASE_URL = "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv"
     LOCAL_DB_FILE = "aircraftDatabase.csv"
-    MONITOR_INTERVAL = 60          # увеличен
-    REQUEST_TIMEOUT = 180          # увеличен
+    MONITOR_INTERVAL = 120          # увеличено до 2 минут
+    REQUEST_TIMEOUT = 300           # увеличено до 5 минут
     DB_DOWNLOAD_TIMEOUT = 90
     DB_RETRY_ATTEMPTS = 3
     DB_RETRY_DELAY = 5
@@ -241,81 +241,100 @@ class AircraftTracker:
 
     async def monitor(self, context: ContextTypes.DEFAULT_TYPE):
         chat_id = context.job.chat_id
-        try:
-            # Увеличиваем таймауты
-            timeout = aiohttp.ClientTimeout(
-                total=Config.REQUEST_TIMEOUT,
-                connect=30,
-                sock_read=Config.REQUEST_TIMEOUT   # теперь 180 секунд
-            )
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                logger.info(f"📡 Запрос к {Config.API_URL}")
-                async with session.get(Config.API_URL) as response:
-                    logger.info(f"📊 Статус ответа: {response.status}")
-                    response.raise_for_status()
-                    logger.info("⏳ Читаю и парсю JSON...")
-                    data = await response.json()
-                    logger.info("✅ JSON распарсен")
+        # Две попытки с паузой
+        for attempt in range(2):
+            try:
+                timeout = aiohttp.ClientTimeout(
+                    total=Config.REQUEST_TIMEOUT,
+                    connect=30,
+                    sock_read=Config.REQUEST_TIMEOUT
+                )
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    logger.info(f"📡 Запрос к {Config.API_URL} (попытка {attempt+1})")
+                    async with session.get(Config.API_URL) as response:
+                        logger.info(f"📊 Статус ответа: {response.status}")
+                        response.raise_for_status()
+                        logger.info("⏳ Читаю и парсю JSON...")
+                        data = await response.json()
+                        logger.info("✅ JSON распарсен")
 
-                    if 'states' not in data or not data['states']:
-                        logger.info("ℹ️ Список самолётов пуст")
+                        if 'states' not in data or not data['states']:
+                            logger.info("ℹ️ Список самолётов пуст")
+                            return
+
+                        states = data['states']
+                        logger.info(f"✈️ Получено самолётов: {len(states)}")
+
+                        # Обработка самолётов
+                        for state in states:
+                            aircraft = self.parse_aircraft(state)
+                            if not aircraft:
+                                continue
+
+                            icao = aircraft['icao']
+                            if icao in self.tracked_aircrafts:
+                                continue
+
+                            db_entry = self.db.get(icao)
+                            if db_entry:
+                                aircraft_type = db_entry['type']
+                                registration = db_entry['registration']
+                            else:
+                                aircraft_type = "N/A"
+                                registration = "N/A"
+
+                            if not is_target_aircraft(aircraft_type):
+                                continue
+
+                            aircraft['registration'] = registration
+                            aircraft['type'] = aircraft_type
+                            self.tracked_aircrafts[icao] = aircraft
+                            aircraft['coordinates'] = format_coordinates(aircraft['lat'], aircraft['lon'])
+
+                            clean_type = normalize_type(aircraft_type)
+                            type_name = AIRCRAFT_NAMES.get(clean_type, aircraft_type if aircraft_type != "N/A" else "Неизвестен")
+
+                            message = (
+                                "🚨 Военный самолет обнаружен!\n"
+                                f"🕒 Время: {aircraft['timestamp'].strftime('%d.%m.%Y %H:%M:%S')}\n"
+                                f"▫️ ICAO: {icao}\n"
+                                f"▫️ Позывной: {aircraft['call_sign']}\n"
+                                f"▫️ Регистрация: {registration}\n"
+                                f"▫️ Тип: {type_name}\n"
+                                f"▫️ Страна: {aircraft['country']}\n"
+                                f"▫️ Координаты: {aircraft['coordinates']}"
+                            )
+
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=message,
+                                disable_web_page_preview=True
+                            )
+                            logger.info(f"✅ Обнаружение: {icao} ({type_name})")
+
+                        # Успешно завершили
                         return
 
-                    states = data['states']
-                    logger.info(f"✈️ Получено самолётов: {len(states)}")
-
-                    for state in states:
-                        aircraft = self.parse_aircraft(state)
-                        if not aircraft:
-                            continue
-
-                        icao = aircraft['icao']
-                        if icao in self.tracked_aircrafts:
-                            continue
-
-                        db_entry = self.db.get(icao)
-                        if db_entry:
-                            aircraft_type = db_entry['type']
-                            registration = db_entry['registration']
-                        else:
-                            aircraft_type = "N/A"
-                            registration = "N/A"
-
-                        if not is_target_aircraft(aircraft_type):
-                            continue
-
-                        aircraft['registration'] = registration
-                        aircraft['type'] = aircraft_type
-                        self.tracked_aircrafts[icao] = aircraft
-                        aircraft['coordinates'] = format_coordinates(aircraft['lat'], aircraft['lon'])
-
-                        clean_type = normalize_type(aircraft_type)
-                        type_name = AIRCRAFT_NAMES.get(clean_type, aircraft_type if aircraft_type != "N/A" else "Неизвестен")
-
-                        message = (
-                            "🚨 Военный самолет обнаружен!\n"
-                            f"🕒 Время: {aircraft['timestamp'].strftime('%d.%m.%Y %H:%M:%S')}\n"
-                            f"▫️ ICAO: {icao}\n"
-                            f"▫️ Позывной: {aircraft['call_sign']}\n"
-                            f"▫️ Регистрация: {registration}\n"
-                            f"▫️ Тип: {type_name}\n"
-                            f"▫️ Страна: {aircraft['country']}\n"
-                            f"▫️ Координаты: {aircraft['coordinates']}"
-                        )
-
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=message,
-                            disable_web_page_preview=True
-                        )
-                        logger.info(f"✅ Обнаружение: {icao} ({type_name})")
-
-        except asyncio.TimeoutError:
-            logger.warning("⏳ Таймаут при запросе к OpenSky (повтор в следующем цикле)")
-        except aiohttp.ClientError as e:
-            logger.error(f"🌐 Ошибка HTTP: {e}")
-        except Exception as e:
-            logger.error(f"❌ Ошибка мониторинга: {e}", exc_info=True)
+            except asyncio.TimeoutError:
+                logger.warning(f"⏳ Таймаут при запросе к OpenSky (попытка {attempt+1})")
+                if attempt == 0:
+                    await asyncio.sleep(10)  # пауза перед повторной попыткой
+                else:
+                    # Вторая попытка тоже не удалась – выходим
+                    return
+            except aiohttp.ClientError as e:
+                logger.error(f"🌐 Ошибка HTTP (попытка {attempt+1}): {e}")
+                if attempt == 0:
+                    await asyncio.sleep(5)
+                else:
+                    return
+            except asyncio.CancelledError:
+                # Задача была отменена – просто выходим
+                logger.info("Задача мониторинга отменена")
+                return
+            except Exception as e:
+                logger.error(f"❌ Ошибка мониторинга (попытка {attempt+1}): {e}", exc_info=True)
+                return
 
     def parse_aircraft(self, state: List) -> Optional[Dict]:
         if not isinstance(state, list) or len(state) < 7:
@@ -369,7 +388,7 @@ async def _start_monitoring_for_chat(chat_id: int, context: ContextTypes.DEFAULT
         first=5,
         chat_id=chat_id,
         name=str(chat_id),
-        job_kwargs={'max_instances': 1}   # предотвращает накопление задач
+        job_kwargs={'max_instances': 1}
     )
     tracker.active_chats.add(chat_id)
     return True

@@ -26,7 +26,7 @@ from telegram.ext import (
 )
 
 # ==================== КОНФИГУРАЦИЯ ====================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8821345795:AAFKqpmAdnNMYTkR9l_iT7BKP4fPk3BdLy0")  # замените на свой
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8821345795:AAFKqpmAdnNMYTkR9l_iT7BKP4fPk3BdLy0")
 PORT = int(os.getenv("PORT", 8443))
 
 # ==================== ЛОГИРОВАНИЕ ====================
@@ -279,7 +279,6 @@ class AircraftDatabase:
         self._load_attempted = False
 
     async def load_async(self):
-        """Асинхронная загрузка базы – сначала локальный файл, затем Google Drive"""
         if self._loaded or self._load_attempted:
             return
         self._load_attempted = True
@@ -287,7 +286,6 @@ class AircraftDatabase:
         db_file = "aircraftDatabase.csv"
         gz_file = db_file + ".gz"
 
-        # Если есть сжатый файл – распаковываем
         if os.path.exists(gz_file) and not os.path.exists(db_file):
             logger.info("Распаковка базы из .gz...")
             try:
@@ -298,15 +296,13 @@ class AircraftDatabase:
             except Exception as e:
                 logger.error(f"Ошибка распаковки: {e}")
 
-        # Если CSV уже есть – загружаем
         if os.path.exists(db_file):
             logger.info("Загрузка базы из локального файла")
             self._load_from_file()
             self._loaded = True
             return
 
-        # Пытаемся скачать с Google Drive
-        file_id = "1sS8a5AZdiXMze8f08iNnVL7kTnlRuarl"  # ID вашего файла
+        file_id = "1sS8a5AZdiXMze8f08iNnVL7kTnlRuarl"
         url = f"https://drive.google.com/uc?export=download&id={file_id}"
         
         logger.info("Скачивание базы с Google Drive...")
@@ -319,7 +315,6 @@ class AircraftDatabase:
                     async with session.get(url, headers=headers) as response:
                         if response.status == 200:
                             content = await response.read()
-                            # Проверяем, не страница ли подтверждения
                             if b'<html' in content[:1024]:
                                 text = content.decode('utf-8', errors='ignore')
                                 match = re.search(r'uc\?export=download&amp;confirm=([a-zA-Z0-9_-]+)&id=' + file_id, text)
@@ -352,7 +347,6 @@ class AircraftDatabase:
             if attempt < max_retries - 1:
                 await asyncio.sleep(10)
 
-        # Если файл всё же появился (частично) – пробуем загрузить
         if os.path.exists(db_file):
             self._load_from_file()
             self._loaded = True
@@ -487,7 +481,7 @@ class AircraftTracker:
 
     async def monitor(self, context: ContextTypes.DEFAULT_TYPE):
         chat_id = context.job.chat_id
-        user_id = chat_id  # для личных чатов
+        user_id = chat_id
         self.reload_config()
         self.clean_old_aircrafts()
 
@@ -806,7 +800,7 @@ async def region_management_menu(update: Update, context: ContextTypes.DEFAULT_T
         reply_markup=get_region_management_keyboard()
     )
 
-# ==================== ВЫБОР РАЙОНОВ (INLINE) ====================
+# ==================== ВЫБОР РАЙОНОВ (INLINE) — ИСПРАВЛЕННЫЕ ФУНКЦИИ ====================
 async def regions_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     selected = UserPreferences.get_regions(user_id)
@@ -846,26 +840,38 @@ async def regions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "region_select_all":
         all_regions = get_all_regions_for_user(user_id)
         new_selected = set(all_regions.keys())
-        UserPreferences.set_regions(user_id, new_selected)
-        await query.message.edit_text("✅ Выбраны все районы.", reply_markup=None)
-        await regions_menu_edit(user_id, query.message)
+        old_selected = UserPreferences.get_regions(user_id)
+        if new_selected != old_selected:
+            UserPreferences.set_regions(user_id, new_selected)
+            await regions_menu_edit(user_id, query.message)
+        else:
+            await query.answer("✅ Уже выбраны все районы.")
         return
 
     if data == "region_deselect_all":
-        UserPreferences.set_regions(user_id, set())
-        await query.message.edit_text("⬜ Все районы сброшены.", reply_markup=None)
-        await regions_menu_edit(user_id, query.message)
+        old_selected = UserPreferences.get_regions(user_id)
+        if old_selected:
+            UserPreferences.set_regions(user_id, set())
+            await regions_menu_edit(user_id, query.message)
+        else:
+            await query.answer("⬜ Все районы уже сброшены.")
         return
 
     if data.startswith("region_toggle_"):
         key = data.split("_")[2]
         selected = UserPreferences.get_regions(user_id)
+        changed = False
         if key in selected:
             selected.remove(key)
+            changed = True
         else:
             selected.add(key)
-        UserPreferences.set_regions(user_id, selected)
-        await regions_menu_edit(user_id, query.message)
+            changed = True
+        if changed:
+            UserPreferences.set_regions(user_id, selected)
+            await regions_menu_edit(user_id, query.message)
+        else:
+            await query.answer("Ничего не изменилось.")
 
 async def regions_menu_edit(user_id: int, message):
     selected = UserPreferences.get_regions(user_id)
@@ -882,11 +888,15 @@ async def regions_menu_edit(user_id: int, message):
     ])
     keyboard.append([InlineKeyboardButton("◀️ Назад в управление районами", callback_data="region_back_to_management")])
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await message.edit_text(
-        "🗺 Выберите районы для отслеживания:\n"
-        "Нажмите на кнопку, чтобы включить/выключить.",
-        reply_markup=reply_markup
-    )
+    try:
+        await message.edit_text(
+            "🗺 Выберите районы для отслеживания:\n"
+            "Нажмите на кнопку, чтобы включить/выключить.",
+            reply_markup=reply_markup
+        )
+    except Exception as e:
+        if "Message is not modified" not in str(e):
+            logger.error(f"Ошибка при редактировании сообщения: {e}")
 
 # ==================== СОЗДАНИЕ РАЙОНА ====================
 async def create_region_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1316,7 +1326,7 @@ async def list_types(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += "\n\nЧастичные:\n" + (", ".join(partial) if partial else " (пусто)")
     await update.message.reply_text(text, reply_markup=get_type_keyboard())
 
-# ==================== НАВИГАЦИЯ МЕЖДУ МЕНЮ ====================
+# ==================== НАВИГАЦИЯ ====================
 async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Главное меню", reply_markup=get_main_keyboard())
 
@@ -1329,7 +1339,7 @@ async def back_to_country_menu(update: Update, context: ContextTypes.DEFAULT_TYP
 async def back_to_type_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Управление типами", reply_markup=get_type_keyboard())
 
-# ==================== ОБРАБОТЧИК НЕИЗВЕСТНЫХ КОМАНД ====================
+# ==================== НЕИЗВЕСТНЫЕ КОМАНДЫ ====================
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Используйте кнопки для управления.",
@@ -1340,18 +1350,17 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def main_async():
     global tracker
     db = AircraftDatabase()
-    await db.load_async()  # асинхронная загрузка базы
+    await db.load_async()
 
     tracker = AircraftTracker(db)
 
-    # Используем глобальный импорт Application
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
 
-    # Основные кнопки
+    # Кнопки
     app.add_handler(MessageHandler(filters.Text("🟢 Запустить мониторинг"), start_monitoring))
     app.add_handler(MessageHandler(filters.Text("🔴 Остановить мониторинг"), stop_monitoring))
     app.add_handler(MessageHandler(filters.Text("📊 Статус"), status))
@@ -1371,75 +1380,71 @@ async def main_async():
     # Callback для районов
     app.add_handler(CallbackQueryHandler(regions_callback, pattern="^region_"))
 
-    # Conversation для интервала
-    interval_conv = ConversationHandler(
+    # Conversation
+    conv_interval = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("⏱ Интервал опроса"), set_interval_start)],
         states={SET_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_interval_receive)]},
         fallbacks=[MessageHandler(filters.Text("❌ Отмена"), set_interval_receive)],
         allow_reentry=True,
     )
-    app.add_handler(interval_conv)
+    app.add_handler(conv_interval)
 
-    # Conversation для времени жизни
-    expiry_conv = ConversationHandler(
+    conv_expiry = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("⏳ Время жизни записи"), set_expiry_start)],
         states={SET_EXPIRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_expiry_receive)]},
         fallbacks=[MessageHandler(filters.Text("❌ Отмена"), set_expiry_receive)],
         allow_reentry=True,
     )
-    app.add_handler(expiry_conv)
+    app.add_handler(conv_expiry)
 
-    # Conversation для стран
-    add_country_conv = ConversationHandler(
+    conv_add_country = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➕ Добавить страну"), add_country_start)],
         states={ADD_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_country_receive)]},
         fallbacks=[MessageHandler(filters.Text("❌ Отмена"), add_country_receive)],
         allow_reentry=True,
     )
-    app.add_handler(add_country_conv)
+    app.add_handler(conv_add_country)
 
-    remove_country_conv = ConversationHandler(
+    conv_remove_country = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➖ Удалить страну"), remove_country_start)],
         states={REMOVE_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_country_receive)]},
         fallbacks=[MessageHandler(filters.Text("◀️ Назад"), remove_country_receive)],
         allow_reentry=True,
     )
-    app.add_handler(remove_country_conv)
+    app.add_handler(conv_remove_country)
 
-    # Conversation для типов
-    add_exact_conv = ConversationHandler(
+    conv_add_exact = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➕ Добавить точный тип"), add_exact_start)],
         states={ADD_EXACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_exact_receive)]},
         fallbacks=[MessageHandler(filters.Text("❌ Отмена"), add_exact_receive)],
         allow_reentry=True,
     )
-    app.add_handler(add_exact_conv)
+    app.add_handler(conv_add_exact)
 
-    remove_exact_conv = ConversationHandler(
+    conv_remove_exact = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➖ Удалить точный тип"), remove_exact_start)],
         states={REMOVE_EXACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_exact_receive)]},
         fallbacks=[MessageHandler(filters.Text("◀️ Назад"), remove_exact_receive)],
         allow_reentry=True,
     )
-    app.add_handler(remove_exact_conv)
+    app.add_handler(conv_remove_exact)
 
-    add_partial_conv = ConversationHandler(
+    conv_add_partial = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➕ Добавить частичный тип"), add_partial_start)],
         states={ADD_PARTIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_partial_receive)]},
         fallbacks=[MessageHandler(filters.Text("❌ Отмена"), add_partial_receive)],
         allow_reentry=True,
     )
-    app.add_handler(add_partial_conv)
+    app.add_handler(conv_add_partial)
 
-    remove_partial_conv = ConversationHandler(
+    conv_remove_partial = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➖ Удалить частичный тип"), remove_partial_start)],
         states={REMOVE_PARTIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_partial_receive)]},
         fallbacks=[MessageHandler(filters.Text("◀️ Назад"), remove_partial_receive)],
         allow_reentry=True,
     )
-    app.add_handler(remove_partial_conv)
+    app.add_handler(conv_remove_partial)
 
-    # Обработчик всего остального
     app.add_handler(MessageHandler(filters.ALL, unknown))
 
     # Запуск
@@ -1450,7 +1455,6 @@ async def main_async():
         await app.initialize()
         await app.start()
         await app.bot.set_webhook(webhook_url)
-        # Для вебхука используем aiohttp, но не импортируем Application повторно
         from aiohttp import web
         async def handle(request):
             return await app.process_update(await request.text())
@@ -1461,7 +1465,7 @@ async def main_async():
         site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
         await site.start()
         logger.info("Бот запущен в режиме вебхука")
-        await asyncio.Event().wait()  # бесконечное ожидание
+        await asyncio.Event().wait()
     else:
         logger.info("Запуск в режиме polling")
         await app.initialize()

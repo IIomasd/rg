@@ -735,7 +735,7 @@ async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if context.job_queue is None:
-        await update.message.reply_text("❌ Ошибка: JobQueue не установлена. Установите зависимость python-telegram-bot[job-queue].")
+        await update.message.reply_text("❌ Ошибка: JobQueue не установлена.")
         return
 
     jobs = context.job_queue.get_jobs_by_name(str(chat_id))
@@ -809,7 +809,7 @@ async def region_management_menu(update: Update, context: ContextTypes.DEFAULT_T
         reply_markup=get_region_management_keyboard()
     )
 
-# ==================== ВЫБОР РАЙОНОВ (ИСПРАВЛЕННЫЙ) ====================
+# ==================== ВЫБОР РАЙОНОВ (ИНЛАЙН-КЛАВИАТУРА) ====================
 async def regions_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await update.message.reply_text(
@@ -836,15 +836,16 @@ async def get_region_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 async def regions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     user_id = query.from_user.id
     data = query.data
 
     if data == "region_back_to_management":
+        await query.answer()
         await query.message.delete()
         await query.message.reply_text("Управление районами", reply_markup=get_region_management_keyboard())
         return
 
+    # Получаем текущие выбранные районы
     selected = UserPreferences.get_regions(user_id)
     new_selected = selected.copy()
 
@@ -860,22 +861,30 @@ async def regions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             new_selected.add(key)
     else:
+        await query.answer("Неизвестная команда")
         return
 
+    # Если изменилось – сохраняем и обновляем клавиатуру
     if new_selected != selected:
         UserPreferences.set_regions(user_id, new_selected)
+        new_markup = await get_region_keyboard(user_id)
         try:
-            await query.message.edit_reply_markup(reply_markup=await get_region_keyboard(user_id))
+            await query.message.edit_reply_markup(reply_markup=new_markup)
+            await query.answer("✅ Обновлено")
         except Exception as e:
-            if "Message is not modified" not in str(e):
+            if "Message is not modified" in str(e):
+                await query.answer("Ничего не изменилось")
+            else:
                 logger.error(f"Ошибка обновления клавиатуры: {e}")
+                await query.answer("❌ Ошибка обновления")
     else:
+        # Если не изменилось – просто уведомляем
         if data == "region_select_all":
-            await query.answer("Уже выбраны все районы.")
+            await query.answer("Уже выбраны все районы")
         elif data == "region_deselect_all":
-            await query.answer("Все районы уже сброшены.")
+            await query.answer("Все районы уже сброшены")
         else:
-            await query.answer("Ничего не изменилось.")
+            await query.answer("Ничего не изменилось")
 
 # ==================== СОЗДАНИЕ РАЙОНА ====================
 async def create_region_start(update: Update, context: ContextTypes.DEFAULT_TYPE):

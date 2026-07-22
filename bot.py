@@ -20,8 +20,8 @@ class Config:
     DATABASE_URL = "https://drive.google.com/uc?export=download&id=1sS8a5AZdiXMze8f08iNnVL7kTnlRuarl"
     FALLBACK_DATABASE_URL = "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv"
     LOCAL_DB_FILE = "aircraftDatabase.csv"
-    MONITOR_INTERVAL = 300          # 5 минут
-    REQUEST_TIMEOUT = 300           # 5 минут
+    MONITOR_INTERVAL = 600          # 10 минут
+    REQUEST_TIMEOUT = 600           # 10 минут
     DB_DOWNLOAD_TIMEOUT = 90
     DB_RETRY_ATTEMPTS = 3
     DB_RETRY_DELAY = 5
@@ -240,23 +240,28 @@ class AircraftTracker:
 
     async def monitor(self, context: ContextTypes.DEFAULT_TYPE):
         chat_id = context.job.chat_id
+        start_time = datetime.now()
         try:
+            # Увеличенные таймауты с явным connect
             timeout = aiohttp.ClientTimeout(
                 total=Config.REQUEST_TIMEOUT,
-                connect=30,
+                connect=60,          # увеличено с 30
                 sock_read=Config.REQUEST_TIMEOUT
             )
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
                 logger.info(f"📡 Запрос к {Config.API_URL}")
                 async with session.get(Config.API_URL) as response:
-                    logger.info(f"📊 Статус ответа: {response.status}")
-                    # Если статус не 200 – логируем и выходим
+                    elapsed = (datetime.now() - start_time).total_seconds()
+                    logger.info(f"📊 Статус ответа: {response.status} (время {elapsed:.1f}с)")
                     if response.status != 200:
                         logger.warning(f"⚠️ Сервер вернул {response.status} – пропускаем цикл")
                         return
                     logger.info("⏳ Читаю JSON...")
                     data = await response.json()
-                    logger.info(f"✅ JSON получен (размер ~{len(str(data))} символов)")
+                    logger.info(f"✅ JSON получен за {(datetime.now() - start_time).total_seconds():.1f}с")
 
                     if 'states' not in data or not data['states']:
                         logger.info("ℹ️ Список самолётов пуст")
@@ -312,7 +317,8 @@ class AircraftTracker:
                         logger.info(f"✅ Обнаружение: {icao} ({type_name})")
 
         except asyncio.TimeoutError:
-            logger.warning("⏳ Таймаут при запросе к OpenSky (повтор в следующем цикле)")
+            elapsed = (datetime.now() - start_time).total_seconds()
+            logger.warning(f"⏳ Таймаут через {elapsed:.1f}с (повтор в следующем цикле)")
         except aiohttp.ClientResponseError as e:
             logger.error(f"🌐 Ошибка HTTP: {e.status} – {e.message}")
         except aiohttp.ClientError as e:

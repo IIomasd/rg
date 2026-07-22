@@ -7,7 +7,7 @@ import urllib.request
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 import aiohttp
-import requests  # <-- добавлено
+import requests
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -18,7 +18,6 @@ class Config:
         raise ValueError("BOT_TOKEN не задан!")
 
     API_URL = "https://opensky-network.org/api/states/all"
-    # Используем Google Drive прямую ссылку
     DATABASE_URL = "https://drive.google.com/uc?export=download&id=1sS8a5AZdiXMze8f08iNnVL7kTnlRuarl"
     FALLBACK_DATABASE_URL = "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv"
     LOCAL_DB_FILE = "aircraftDatabase.csv"
@@ -143,7 +142,7 @@ def is_target_aircraft(aircraft_type: str) -> bool:
             return True
     return False
 
-# -------------------- ЗАГРУЗЧИК БАЗЫ (с повторными попытками) --------------------
+# -------------------- ЗАГРУЗЧИК БАЗЫ --------------------
 class AircraftDatabase:
     def __init__(self):
         self.data: Dict[str, Dict[str, str]] = {}
@@ -162,7 +161,6 @@ class AircraftDatabase:
         logger.info(f"База загружена: {len(self.data)} записей")
 
     def _download_sync(self):
-        """Скачивание с повторными попытками, сначала Google Drive, потом fallback."""
         for attempt in range(1, Config.DB_RETRY_ATTEMPTS + 1):
             try:
                 logger.info(f"Попытка {attempt} из {Config.DB_RETRY_ATTEMPTS} – скачивание с Google Drive")
@@ -181,14 +179,13 @@ class AircraftDatabase:
                     return
                 else:
                     logger.warning(f"Google Drive ответил {response.status_code}, пробую fallback...")
-                    break  # переходим к fallback
+                    break
             except (requests.RequestException, OSError) as e:
                 logger.warning(f"Ошибка при скачивании с Google Drive (попытка {attempt}): {e}")
                 if attempt < Config.DB_RETRY_ATTEMPTS:
                     import time
                     time.sleep(Config.DB_RETRY_DELAY * attempt)
                 else:
-                    # Пробуем fallback
                     logger.info("Попытка скачать с оригинального OpenSky...")
                     try:
                         response = requests.get(
@@ -209,9 +206,7 @@ class AircraftDatabase:
                     except Exception as e2:
                         logger.error(f"Ошибка fallback: {e2}")
 
-        # Если все попытки провалились
         logger.error("Не удалось скачать базу данных. Будет использована пустая база.")
-        # Создаём пустой файл, чтобы не пытаться снова при следующем запуске
         with open(Config.LOCAL_DB_FILE, "w") as f:
             f.write("icao24,registration,model\n")
         self.data = {}
@@ -358,6 +353,8 @@ def get_main_keyboard():
     )
 
 async def _start_monitoring_for_chat(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    if context.job_queue is None:
+        raise RuntimeError("JobQueue не доступен. Убедитесь, что установлен python-telegram-bot[job-queue]")
     jobs = context.job_queue.get_jobs_by_name(str(chat_id))
     if jobs:
         return False
@@ -379,11 +376,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Автоматически запускаю мониторинг...",
         reply_markup=get_main_keyboard()
     )
-    started = await _start_monitoring_for_chat(chat_id, context)
-    if started:
-        await update.message.reply_text(f"✅ Мониторинг активен (каждые {Config.MONITOR_INTERVAL} сек.)")
-    else:
-        await update.message.reply_text("⚠️ Мониторинг уже запущен.")
+    try:
+        started = await _start_monitoring_for_chat(chat_id, context)
+        if started:
+            await update.message.reply_text(f"✅ Мониторинг активен (каждые {Config.MONITOR_INTERVAL} сек.)")
+        else:
+            await update.message.reply_text("⚠️ Мониторинг уже запущен.")
+    except RuntimeError as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}\nПожалуйста, переустановите бота с правильными зависимостями.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -409,14 +409,20 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    started = await _start_monitoring_for_chat(chat_id, context)
-    if started:
-        await update.message.reply_text("✅ Мониторинг запущен.", reply_markup=get_main_keyboard())
-    else:
-        await update.message.reply_text("⚠️ Мониторинг уже активен.", reply_markup=get_main_keyboard())
+    try:
+        started = await _start_monitoring_for_chat(chat_id, context)
+        if started:
+            await update.message.reply_text("✅ Мониторинг запущен.", reply_markup=get_main_keyboard())
+        else:
+            await update.message.reply_text("⚠️ Мониторинг уже активен.", reply_markup=get_main_keyboard())
+    except RuntimeError as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def stop_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if context.job_queue is None:
+        await update.message.reply_text("❌ Планировщик задач не доступен.", reply_markup=get_main_keyboard())
+        return
     jobs = context.job_queue.get_jobs_by_name(str(chat_id))
     if not jobs:
         await update.message.reply_text("ℹ️ Мониторинг не активен", reply_markup=get_main_keyboard())

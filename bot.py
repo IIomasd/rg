@@ -1,386 +1,28 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import logging
 import csv
 import os
 import json
 import asyncio
-import uuid
-import gzip
-import shutil
-import re
+import urllib.request
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set, Any
-
+from typing import Dict, List, Optional, Any
 import aiohttp
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-    CallbackQueryHandler,
-    ConversationHandler,
-)
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-# ==================== КОНФИГУРАЦИЯ ====================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8821345795:AAFKqpmAdnNMYTkR9l_iT7BKP4fPk3BdLy0")
-PORT = int(os.getenv("PORT", 8443))
+# -------------------- КОНФИГУРАЦИЯ --------------------
+class Config:
+    BOT_TOKEN = os.getenv("BOT_TOKEN")   # токен из переменной окружения
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN не задан! Установите переменную окружения.")
+    
+    API_URL = "https://opensky-network.org/api/states/all"
+    DATABASE_URL = "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv"
+    LOCAL_DB_FILE = "aircraftDatabase.csv"
+    MONITOR_INTERVAL = 30
+    REQUEST_TIMEOUT = 120
 
-# ==================== ЛОГИРОВАНИЕ ====================
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# ==================== НАСТРОЙКИ ПО УМОЛЧАНИЮ ====================
-DEFAULT_CONFIG = {
-    "interval_seconds": 60,  # увеличен до 60 секунд
-    "expiry_minutes": 60,
-    "allowed_countries": [],
-    "target_exact": [
-        'C130', 'KC130', 'MC130', 'KC130J', 'C17', 'C5',
-        'C2', 'KC135', 'KC10', 'KC46', 'DC10', 'A400M',
-        'P1', 'CP140', 'F16', 'F15', 'F22', 'F35', 'F18',
-        'EA18G', 'B1', 'B2', 'B52', 'E3', 'E2', 'E8', 'E7',
-        'E4', 'E6', 'E767', 'P3', 'P8', 'U2', 'RC135', 'E2C',
-        'E2K', 'E737', 'C2A', 'K35R', 'R135', 'C30', 'C30J',
-        'C5M', 'E3TF'
-    ],
-    "target_partial": [
-        'C17A', 'KC135R', 'KC135T', 'KC10A', 'KC46A',
-        'F16C', 'F15E', 'F22A', 'F35A', 'F35B', 'F35C',
-        'EA18G', 'B1B', 'B2A', 'B52', 'E3G', 'E2D', 'P8A', 'MC130',
-        'K35R', 'R135', 'C30', 'C30J', 'E3TF'
-    ]
-}
-
-# ==================== ПРЕДОПРЕДЕЛЁННЫЕ РАЙОНЫ ====================
-PREDEFINED_REGIONS = {
-    "region_1": {
-        "name": "🌏 Дальний Восток и Тихий океан",
-        "description": "Японское море, Жёлтое море, Восточно-Китайское море, Южно-Китайское море, Тихий океан, Берингово море",
-        "boxes": [
-            [0, 65, 100, 180],
-            [0, 65, -180, -170]
-        ]
-    },
-    "region_2": {
-        "name": "🌏 Индийский океан и Аравийский полуостров",
-        "description": "Индийский океан, Аравийское море, Красное море, Аравийский полуостров",
-        "boxes": [
-            [0, 30, 30, 80]
-        ]
-    },
-    "region_3": {
-        "name": "🌍 Европа, Чёрное и Средиземное моря",
-        "description": "Чёрное море, Средиземное море, Европа",
-        "boxes": [
-            [30, 70, -10, 45]
-        ]
-    }
-}
-
-# ==================== ЗАГРУЗЧИК КОНФИГА ====================
-class ConfigManager:
-    CONFIG_FILE = "tracker_config.json"
-
-    @classmethod
-    def load(cls) -> Dict:
-        if os.path.exists(cls.CONFIG_FILE):
-            try:
-                with open(cls.CONFIG_FILE, "r", encoding="utf-8") as f:
-                    config = json.load(f)
-                    for key, val in DEFAULT_CONFIG.items():
-                        if key not in config:
-                            config[key] = val
-                    return config
-            except Exception as e:
-                logger.error(f"Ошибка загрузки конфига: {e}")
-        return DEFAULT_CONFIG.copy()
-
-    @classmethod
-    def save(cls, config: Dict):
-        try:
-            with open(cls.CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(config, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"Ошибка сохранения конфига: {e}")
-
-    @classmethod
-    def get_interval(cls) -> int:
-        return cls.load().get("interval_seconds", 60)
-
-    @classmethod
-    def get_expiry(cls) -> int:
-        return cls.load().get("expiry_minutes", 60)
-
-# ==================== ПРЕДПОЧТЕНИЯ ПОЛЬЗОВАТЕЛЕЙ ====================
-class UserPreferences:
-    PREF_FILE = "user_preferences.json"
-
-    @classmethod
-    def load(cls) -> Dict[int, Set[str]]:
-        if os.path.exists(cls.PREF_FILE):
-            try:
-                with open(cls.PREF_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    return {int(k): set(v) for k, v in data.items()}
-            except Exception as e:
-                logger.error(f"Ошибка загрузки предпочтений: {e}")
-        return {}
-
-    @classmethod
-    def save(cls, prefs: Dict[int, Set[str]]):
-        try:
-            data = {str(k): list(v) for k, v in prefs.items()}
-            with open(cls.PREF_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"Ошибка сохранения предпочтений: {e}")
-
-    @classmethod
-    def get_regions(cls, user_id: int) -> Set[str]:
-        prefs = cls.load()
-        return prefs.get(user_id, set())
-
-    @classmethod
-    def set_regions(cls, user_id: int, regions: Set[str]):
-        prefs = cls.load()
-        if regions:
-            prefs[user_id] = regions
-        else:
-            prefs.pop(user_id, None)
-        cls.save(prefs)
-
-    @classmethod
-    def add_region(cls, user_id: int, region_key: str):
-        prefs = cls.load()
-        if user_id not in prefs:
-            prefs[user_id] = set()
-        prefs[user_id].add(region_key)
-        cls.save(prefs)
-
-    @classmethod
-    def remove_region(cls, user_id: int, region_key: str):
-        prefs = cls.load()
-        if user_id in prefs:
-            prefs[user_id].discard(region_key)
-            if not prefs[user_id]:
-                del prefs[user_id]
-            cls.save(prefs)
-
-# ==================== ПОЛЬЗОВАТЕЛЬСКИЕ РАЙОНЫ ====================
-class CustomRegionManager:
-    FILE = "custom_regions.json"
-
-    @classmethod
-    def load(cls) -> Dict[int, Dict[str, Dict]]:
-        if os.path.exists(cls.FILE):
-            try:
-                with open(cls.FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    return {int(k): v for k, v in data.items()}
-            except Exception as e:
-                logger.error(f"Ошибка загрузки пользовательских районов: {e}")
-        return {}
-
-    @classmethod
-    def save(cls, custom_regions: Dict[int, Dict[str, Dict]]):
-        try:
-            data = {str(k): v for k, v in custom_regions.items()}
-            with open(cls.FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"Ошибка сохранения пользовательских районов: {e}")
-
-    @classmethod
-    def get_user_regions(cls, user_id: int) -> Dict[str, Dict]:
-        all_data = cls.load()
-        return all_data.get(user_id, {})
-
-    @classmethod
-    def add_region(cls, user_id: int, region_key: str, region_data: Dict):
-        all_data = cls.load()
-        if user_id not in all_data:
-            all_data[user_id] = {}
-        all_data[user_id][region_key] = region_data
-        cls.save(all_data)
-
-    @classmethod
-    def remove_region(cls, user_id: int, region_key: str):
-        all_data = cls.load()
-        if user_id in all_data and region_key in all_data[user_id]:
-            del all_data[user_id][region_key]
-            if not all_data[user_id]:
-                del all_data[user_id]
-            cls.save(all_data)
-
-# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
-def get_all_regions_for_user(user_id: int) -> Dict[str, Dict]:
-    regions = PREDEFINED_REGIONS.copy()
-    custom = CustomRegionManager.get_user_regions(user_id)
-    regions.update(custom)
-    return regions
-
-def format_coordinates(lat: Optional[float], lon: Optional[float]) -> str:
-    if lat is None or lon is None:
-        return "📍 Координаты недоступны"
-    try:
-        lat_dir = "С" if lat >= 0 else "Ю"
-        lon_dir = "В" if lon >= 0 else "З"
-        return f"{abs(lat):.2f}°{lat_dir}, {abs(lon):.2f}°{lon_dir}"
-    except TypeError:
-        return "📍 Координаты недоступны"
-
-def normalize_type(aircraft_type: str) -> str:
-    if not aircraft_type:
-        return ""
-    return aircraft_type.replace("-", "").replace(" ", "").replace("_", "")
-
-def is_target_aircraft(aircraft_type: str, config_targets: Dict[str, List[str]]) -> bool:
-    if not aircraft_type:
-        return False
-    clean = normalize_type(aircraft_type)
-    exact_list = config_targets.get("exact", [])
-    partial_list = config_targets.get("partial", [])
-    if clean in exact_list:
-        return True
-    for pattern in partial_list:
-        if pattern in clean:
-            return True
-    return False
-
-def is_in_region(lat: float, lon: float, region_data: Dict) -> bool:
-    boxes = region_data.get("boxes", [])
-    for box in boxes:
-        min_lat, max_lat, min_lon, max_lon = box
-        if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
-            return True
-    return False
-
-def is_in_selected_regions(lat: float, lon: float, selected_keys: Set[str], all_regions: Dict[str, Dict]) -> bool:
-    if not selected_keys:
-        return False
-    for key in selected_keys:
-        region = all_regions.get(key)
-        if region and is_in_region(lat, lon, region):
-            return True
-    return False
-
-# ==================== ЗАГРУЗЧИК БАЗЫ ICAO ====================
-class AircraftDatabase:
-    def __init__(self):
-        self.data: Dict[str, Dict[str, str]] = {}
-        self._loaded = False
-        self._load_attempted = False
-
-    async def load_async(self):
-        if self._loaded or self._load_attempted:
-            return
-        self._load_attempted = True
-
-        db_file = "aircraftDatabase.csv"
-        gz_file = db_file + ".gz"
-
-        if os.path.exists(gz_file) and not os.path.exists(db_file):
-            logger.info("Распаковка базы из .gz...")
-            try:
-                with gzip.open(gz_file, 'rb') as f_in:
-                    with open(db_file, 'wb') as f_out:
-                        shutil.copyfileobj(f_in, f_out)
-                logger.info("Распаковка завершена")
-            except Exception as e:
-                logger.error(f"Ошибка распаковки: {e}")
-
-        if os.path.exists(db_file):
-            logger.info("Загрузка базы из локального файла")
-            self._load_from_file()
-            self._loaded = True
-            return
-
-        file_id = "1sS8a5AZdiXMze8f08iNnVL7kTnlRuarl"
-        url = f"https://drive.google.com/uc?export=download&id={file_id}"
-        
-        logger.info("Скачивание базы с Google Drive...")
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                timeout = aiohttp.ClientTimeout(total=300, connect=60)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    headers = {"User-Agent": "Mozilla/5.0"}
-                    async with session.get(url, headers=headers) as response:
-                        if response.status == 200:
-                            content = await response.read()
-                            if b'<html' in content[:1024]:
-                                text = content.decode('utf-8', errors='ignore')
-                                match = re.search(r'uc\?export=download&amp;confirm=([a-zA-Z0-9_-]+)&id=' + file_id, text)
-                                if match:
-                                    confirm = match.group(1)
-                                    download_url = f"https://drive.google.com/uc?export=download&confirm={confirm}&id={file_id}"
-                                    async with session.get(download_url, headers=headers) as resp2:
-                                        if resp2.status == 200:
-                                            with open(db_file, 'wb') as f:
-                                                f.write(await resp2.read())
-                                            logger.info("База скачана с подтверждением")
-                                            self._load_from_file()
-                                            self._loaded = True
-                                            return
-                                else:
-                                    logger.warning("Не удалось найти ссылку подтверждения")
-                            else:
-                                with open(db_file, 'wb') as f:
-                                    f.write(content)
-                                logger.info("База скачана с Google Drive")
-                                self._load_from_file()
-                                self._loaded = True
-                                return
-                        else:
-                            logger.error(f"Ошибка HTTP {response.status}")
-            except asyncio.TimeoutError:
-                logger.error(f"Таймаут при скачивании (попытка {attempt+1})")
-            except Exception as e:
-                logger.error(f"Ошибка скачивания: {e}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(10)
-
-        if os.path.exists(db_file):
-            self._load_from_file()
-            self._loaded = True
-            logger.warning("Использую существующий файл (возможно, неполный)")
-        else:
-            logger.error("Не удалось загрузить базу. Фильтрация по типу отключена.")
-            self._loaded = False
-
-    def _load_from_file(self):
-        try:
-            with open("aircraftDatabase.csv", "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    icao = row.get("icao24", "").strip().lower()
-                    if not icao:
-                        continue
-                    registration = row.get("registration", "").strip()
-                    aircraft_type = row.get("model", "").strip()
-                    self.data[icao] = {
-                        "registration": registration if registration else "N/A",
-                        "type": aircraft_type if aircraft_type else "N/A"
-                    }
-            logger.info(f"Загружено {len(self.data)} записей из базы")
-        except Exception as e:
-            logger.error(f"Ошибка чтения базы: {e}")
-            self.data = {}
-
-    def get(self, icao: str) -> Optional[Dict[str, str]]:
-        return self.data.get(icao.lower())
-
-    def is_loaded(self) -> bool:
-        return self._loaded
-
-# ==================== КРАСИВЫЕ НАЗВАНИЯ САМОЛЁТОВ ====================
+# -------------------- ДАННЫЕ --------------------
 AIRCRAFT_NAMES = {
     'B52': 'B-52 Stratofortress',
     'C17': 'C-17 Globemaster III',
@@ -443,72 +85,132 @@ AIRCRAFT_NAMES = {
     'KC130J': 'KC-130J'
 }
 
-# ==================== ОСНОВНОЙ КЛАСС ТРЕКЕРА ====================
+TARGET_TYPES = {
+    'exact': {
+        'C130', 'KC130', 'MC130', 'KC130J', 'C17', 'C5',
+        'C2', 'KC135', 'KC10', 'KC46', 'DC10', 'A400M',
+        'P1', 'CP140', 'F16', 'F15', 'F22', 'F35', 'F18',
+        'EA18G', 'B1', 'B2', 'B52', 'E3', 'E2', 'E8', 'E7',
+        'E4', 'E6', 'E767', 'P3', 'P8', 'U2', 'RC135', 'E2C',
+        'E2K', 'E737', 'C2A', 'K35R', 'R135', 'C30', 'C30J',
+        'C5M', 'E3TF'
+    },
+    'partial': {
+        'C17A', 'KC135R', 'KC135T', 'KC10A', 'KC46A',
+        'F16C', 'F15E', 'F22A', 'F35A', 'F35B', 'F35C',
+        'EA18G', 'B1B', 'B2A', 'B52', 'E3G', 'E2D', 'P8A', 'MC130',
+        'K35R', 'R135', 'C30', 'C30J', 'E3TF'
+    }
+}
+
+# -------------------- ЛОГИРОВАНИЕ --------------------
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# -------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ --------------------
+def format_coordinates(lat: Optional[float], lon: Optional[float]) -> str:
+    if lat is None or lon is None:
+        return "📍 Координаты недоступны"
+    try:
+        lat_dir = "С" if lat >= 0 else "Ю"
+        lon_dir = "В" if lon >= 0 else "З"
+        return f"{abs(lat):.2f}°{lat_dir}, {abs(lon):.2f}°{lon_dir}"
+    except TypeError:
+        return "📍 Координаты недоступны"
+
+def normalize_type(aircraft_type: str) -> str:
+    if not aircraft_type:
+        return ""
+    return aircraft_type.replace("-", "").replace(" ", "").replace("_", "")
+
+def is_target_aircraft(aircraft_type: str) -> bool:
+    if not aircraft_type:
+        return False
+    clean = normalize_type(aircraft_type)
+    if clean in TARGET_TYPES['exact']:
+        return True
+    for pattern in TARGET_TYPES['partial']:
+        if pattern in clean:
+            return True
+    return False
+
+# -------------------- ЗАГРУЗЧИК БАЗЫ --------------------
+class AircraftDatabase:
+    def __init__(self):
+        self.data: Dict[str, Dict[str, str]] = {}
+        self._loaded = False
+
+    def load_sync(self):
+        if self._loaded:
+            return
+        if not os.path.exists(Config.LOCAL_DB_FILE):
+            logger.info("Скачиваю базу данных...")
+            self._download_sync()
+        else:
+            logger.info("Загрузка базы из локального файла")
+        self._load_from_file()
+        self._loaded = True
+        logger.info(f"База загружена: {len(self.data)} записей")
+
+    def _download_sync(self):
+        try:
+            urllib.request.urlretrieve(Config.DATABASE_URL, Config.LOCAL_DB_FILE)
+            logger.info("База скачана")
+        except Exception as e:
+            logger.error(f"Ошибка скачивания базы: {e}")
+            raise
+
+    def _load_from_file(self):
+        try:
+            with open(Config.LOCAL_DB_FILE, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    icao = row.get("icao24", "").strip().lower()
+                    if not icao:
+                        continue
+                    registration = row.get("registration", "").strip()
+                    aircraft_type = row.get("model", "").strip()
+                    self.data[icao] = {
+                        "registration": registration if registration else "N/A",
+                        "type": aircraft_type if aircraft_type else "N/A"
+                    }
+        except Exception as e:
+            logger.error(f"Ошибка чтения базы: {e}")
+            self.data = {}
+
+    def get(self, icao: str) -> Optional[Dict[str, str]]:
+        return self.data.get(icao.lower())
+
+# -------------------- ОСНОВНОЙ КЛАСС ТРЕКЕРА --------------------
 class AircraftTracker:
     def __init__(self, db: AircraftDatabase):
         self.db = db
         self.tracked_aircrafts: Dict[str, Dict] = {}
-        self.active_chats: Set[int] = set()
-        self._config = ConfigManager.load()
-        self._targets = {
-            "exact": self._config.get("target_exact", DEFAULT_CONFIG["target_exact"]),
-            "partial": self._config.get("target_partial", DEFAULT_CONFIG["target_partial"])
-        }
-        self._filter_by_type = self.db.is_loaded()
-        if not self._filter_by_type:
-            logger.warning("Фильтрация по типу отключена – база не загружена")
-
-    def reload_config(self):
-        self._config = ConfigManager.load()
-        self._targets = {
-            "exact": self._config.get("target_exact", DEFAULT_CONFIG["target_exact"]),
-            "partial": self._config.get("target_partial", DEFAULT_CONFIG["target_partial"])
-        }
-        self._allowed_countries = self._config.get("allowed_countries", [])
-        self._expiry_minutes = self._config.get("expiry_minutes", 60)
-
-    def clean_old_aircrafts(self):
-        expiry = timedelta(minutes=self._config.get("expiry_minutes", 60))
-        now = datetime.now()
-        to_delete = []
-        for icao, data in self.tracked_aircrafts.items():
-            if now - data['timestamp'] > expiry:
-                to_delete.append(icao)
-        for icao in to_delete:
-            del self.tracked_aircrafts[icao]
-        if to_delete:
-            logger.info(f"Очищено старых бортов: {len(to_delete)}")
+        self.active_chats: set = set()
 
     async def monitor(self, context: ContextTypes.DEFAULT_TYPE):
         chat_id = context.job.chat_id
-        user_id = chat_id
-        self.reload_config()
-        self.clean_old_aircrafts()
-
-        selected_keys = UserPreferences.get_regions(user_id)
-        all_regions = get_all_regions_for_user(user_id)
-
-        # Логируем выбранные районы
-        logger.info(f"Чат {chat_id}: выбраны районы: {selected_keys}")
-
-        if not selected_keys:
-            logger.info(f"Чат {chat_id}: районы не выбраны, пропускаем")
-            return
-
         try:
-            timeout = aiohttp.ClientTimeout(total=180, connect=30, sock_read=120)  # увеличен таймаут
+            timeout = aiohttp.ClientTimeout(total=Config.REQUEST_TIMEOUT, connect=30, sock_read=60)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                url = "https://opensky-network.org/api/states/all"
-                async with session.get(url) as response:
+                logger.info(f"📡 Запрос к {Config.API_URL}")
+                async with session.get(Config.API_URL) as response:
+                    logger.info(f"📊 Статус ответа: {response.status}")
                     response.raise_for_status()
+                    logger.info("⏳ Читаю и парсю JSON...")
                     data = await response.json()
-                    states = data.get('states', [])
-                    if not states:
-                        logger.info(f"Чат {chat_id}: OpenSky вернул пустой список")
+                    logger.info("✅ JSON распарсен")
+
+                    if 'states' not in data or not data['states']:
+                        logger.info("ℹ️ Список самолётов пуст")
                         return
 
-                    logger.info(f"Чат {chat_id}: получено {len(states)} самолётов")
-                    allowed_countries = self._config.get("allowed_countries", [])
+                    states = data['states']
+                    logger.info(f"✈️ Получено самолётов: {len(states)}")
+
                     for state in states:
                         aircraft = self.parse_aircraft(state)
                         if not aircraft:
@@ -518,24 +220,6 @@ class AircraftTracker:
                         if icao in self.tracked_aircrafts:
                             continue
 
-                        lat = aircraft['lat']
-                        lon = aircraft['lon']
-                        if lat is None or lon is None:
-                            continue
-
-                        # Логируем координаты для отладки
-                        logger.debug(f"Самолёт {icao}: lat={lat}, lon={lon}")
-
-                        # Проверяем, попадает ли в выбранные районы
-                        in_region = is_in_selected_regions(lat, lon, selected_keys, all_regions)
-                        if not in_region:
-                            continue
-
-                        if allowed_countries:
-                            country = aircraft.get('country', '').strip()
-                            if country.lower() not in [c.lower() for c in allowed_countries]:
-                                continue
-
                         db_entry = self.db.get(icao)
                         if db_entry:
                             aircraft_type = db_entry['type']
@@ -544,23 +228,16 @@ class AircraftTracker:
                             aircraft_type = "N/A"
                             registration = "N/A"
 
-                        if self._filter_by_type and not is_target_aircraft(aircraft_type, self._targets):
+                        if not is_target_aircraft(aircraft_type):
                             continue
 
                         aircraft['registration'] = registration
                         aircraft['type'] = aircraft_type
                         self.tracked_aircrafts[icao] = aircraft
-                        aircraft['coordinates'] = format_coordinates(lat, lon)
+                        aircraft['coordinates'] = format_coordinates(aircraft['lat'], aircraft['lon'])
 
                         clean_type = normalize_type(aircraft_type)
                         type_name = AIRCRAFT_NAMES.get(clean_type, aircraft_type if aircraft_type != "N/A" else "Неизвестен")
-
-                        region_names = []
-                        for key in selected_keys:
-                            region = all_regions.get(key)
-                            if region and is_in_region(lat, lon, region):
-                                region_names.append(region['name'])
-                        region_str = ", ".join(region_names) if region_names else "неизвестен"
 
                         message = (
                             "🚨 Военный самолет обнаружен!\n"
@@ -570,8 +247,7 @@ class AircraftTracker:
                             f"▫️ Регистрация: {registration}\n"
                             f"▫️ Тип: {type_name}\n"
                             f"▫️ Страна: {aircraft['country']}\n"
-                            f"▫️ Координаты: {aircraft['coordinates']}\n"
-                            f"▫️ Район: {region_str}"
+                            f"▫️ Координаты: {aircraft['coordinates']}"
                         )
 
                         await context.bot.send_message(
@@ -579,10 +255,10 @@ class AircraftTracker:
                             text=message,
                             disable_web_page_preview=True
                         )
-                        logger.info(f"✅ Обнаружение: {icao} ({type_name}) в районе {region_str}")
+                        logger.info(f"✅ Обнаружение: {icao} ({type_name})")
 
         except asyncio.TimeoutError:
-            logger.warning("⏳ Таймаут при запросе к OpenSky (превышено 180 сек)")
+            logger.warning("⏳ Таймаут при запросе к OpenSky (повтор в следующем цикле)")
         except aiohttp.ClientError as e:
             logger.error(f"🌐 Ошибка HTTP: {e}")
         except Exception as e:
@@ -617,861 +293,137 @@ class AircraftTracker:
             'type': 'N/A'
         }
 
-# ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
-tracker: Optional[AircraftTracker] = None
+# -------------------- ОБРАБОТЧИКИ КОМАНД --------------------
+tracker = None
 
-# ==================== СОСТОЯНИЯ ДЛЯ CONVERSATION ====================
-(
-    SET_INTERVAL, SET_EXPIRY,
-    ADD_COUNTRY, REMOVE_COUNTRY,
-    ADD_EXACT, REMOVE_EXACT,
-    ADD_PARTIAL, REMOVE_PARTIAL,
-    CREATE_REGION_NAME, CREATE_REGION_BOX, DELETE_REGION
-) = range(11)
-
-# ==================== КЛАВИАТУРЫ ====================
-def get_main_keyboard() -> ReplyKeyboardMarkup:
-    buttons = [
-        [KeyboardButton("🟢 Запустить мониторинг")],
-        [KeyboardButton("🔴 Остановить мониторинг")],
-        [KeyboardButton("📊 Статус")],
-        [KeyboardButton("⚙️ Настройки")],
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-def get_settings_keyboard() -> ReplyKeyboardMarkup:
-    buttons = [
-        [KeyboardButton("⏱ Интервал опроса")],
-        [KeyboardButton("⏳ Время жизни записи")],
-        [KeyboardButton("🌍 Фильтр по странам")],
-        [KeyboardButton("✈️ Управление типами")],
-        [KeyboardButton("🗺 Мои районы")],
-        [KeyboardButton("◀️ Главное меню")],
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-def get_region_management_keyboard() -> ReplyKeyboardMarkup:
-    buttons = [
-        [KeyboardButton("✏️ Выбрать районы")],
-        [KeyboardButton("➕ Создать район")],
-        [KeyboardButton("🗑 Удалить район")],
-        [KeyboardButton("📋 Мои районы")],
-        [KeyboardButton("◀️ Назад в настройки")],
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-def get_country_keyboard() -> ReplyKeyboardMarkup:
-    buttons = [
-        [KeyboardButton("➕ Добавить страну")],
-        [KeyboardButton("➖ Удалить страну")],
-        [KeyboardButton("📋 Список стран")],
-        [KeyboardButton("◀️ Назад в настройки")],
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-def get_type_keyboard() -> ReplyKeyboardMarkup:
-    buttons = [
-        [KeyboardButton("➕ Добавить точный тип")],
-        [KeyboardButton("➖ Удалить точный тип")],
-        [KeyboardButton("➕ Добавить частичный тип")],
-        [KeyboardButton("➖ Удалить частичный тип")],
-        [KeyboardButton("📋 Список типов")],
-        [KeyboardButton("◀️ Назад в настройки")],
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-def get_cancel_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
-
-def get_remove_country_keyboard(countries: List[str]) -> ReplyKeyboardMarkup:
-    keyboard = []
-    for country in countries:
-        keyboard.append([KeyboardButton(f"❌ {country}")])
-    keyboard.append([KeyboardButton("◀️ Назад")])
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-def get_remove_type_keyboard(types: List[str]) -> ReplyKeyboardMarkup:
-    keyboard = []
-    for t in types:
-        keyboard.append([KeyboardButton(f"❌ {t}")])
-    keyboard.append([KeyboardButton("◀️ Назад")])
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-def get_remove_region_keyboard(regions: Dict[str, Dict]) -> ReplyKeyboardMarkup:
-    keyboard = []
-    for key, reg in regions.items():
-        if key.startswith("custom_"):
-            keyboard.append([KeyboardButton(f"❌ {reg['name']}")])
-    keyboard.append([KeyboardButton("◀️ Назад")])
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-# ==================== ОБРАБОТЧИКИ КОМАНД ====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🛩 Военный авиационный трекер\n"
-        "Отслеживание военных самолётов по данным OpenSky.\n"
-        "Используйте кнопки для управления.",
-        reply_markup=get_main_keyboard()
+def get_main_keyboard():
+    return ReplyKeyboardMarkup(
+        [["🟢 Запустить мониторинг", "🔴 Остановить", "📊 Статус"]],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Выберите действие"
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 *Военный авиационный трекер*\n\n"
-        "Отслеживает военные самолёты по данным OpenSky.\n"
-        "Фильтрация по типу, странам и географическим районам.\n"
-        "При обнаружении приходит уведомление.\n\n"
-        "*Кнопки:*\n"
-        "🟢 Запустить мониторинг — начать отслеживание в этом чате\n"
-        "🔴 Остановить мониторинг — остановить\n"
-        "📊 Статус — показать статистику\n"
-        "⚙️ Настройки — изменить параметры (интервал, страны, типы, районы)\n\n"
-        "Все настройки доступны каждому пользователю.",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
-    )
-
-async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    if tracker is None:
-        await update.message.reply_text("❌ Трекер не инициализирован.")
-        return
-
-    selected = UserPreferences.get_regions(user_id)
-    if not selected:
-        await update.message.reply_text(
-            "⚠️ Сначала выберите хотя бы один район в настройках (🗺 Мои районы → ✏️ Выбрать районы).",
-            reply_markup=get_main_keyboard()
-        )
-        return
-
-    if context.job_queue is None:
-        await update.message.reply_text("❌ Ошибка: JobQueue не установлена.")
-        return
-
+async def _start_monitoring_for_chat(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     jobs = context.job_queue.get_jobs_by_name(str(chat_id))
     if jobs:
-        await update.message.reply_text("⚠️ Мониторинг уже активен.")
-        return
-
-    interval = ConfigManager.get_interval()
+        return False
     context.job_queue.run_repeating(
         tracker.monitor,
-        interval=timedelta(seconds=interval),
+        interval=timedelta(seconds=Config.MONITOR_INTERVAL),
         first=5,
         chat_id=chat_id,
         name=str(chat_id)
     )
     tracker.active_chats.add(chat_id)
+    return True
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     await update.message.reply_text(
-        f"✅ Мониторинг запущен (интервал {interval} сек.)",
+        "🛩 Военный авиационный трекер\n"
+        "Отслеживание военных самолётов по типу (OpenSky).\n"
+        "Автоматически запускаю мониторинг...",
+        reply_markup=get_main_keyboard()
+    )
+    started = await _start_monitoring_for_chat(chat_id, context)
+    if started:
+        await update.message.reply_text(f"✅ Мониторинг активен (каждые {Config.MONITOR_INTERVAL} сек.)")
+    else:
+        await update.message.reply_text("⚠️ Мониторинг уже запущен.")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 *Военный авиационный трекер*\n\n"
+        "Бот отслеживает военные самолёты по данным OpenSky Network.\n"
+        "Фильтрация по типу из списка целевых (B-52, F-16, C-17 и др.).\n"
+        "При обнаружении приходит уведомление с регистрацией и типом.\n\n"
+        "*Команды:*\n"
+        "/start — запустить мониторинг\n"
+        "/help — справка\n"
+        "/status — статус\n"
+        "/stop — остановить",
+        parse_mode="Markdown",
         reply_markup=get_main_keyboard()
     )
 
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"🔍 Отслежено бортов: {len(tracker.tracked_aircrafts)}\n"
+        f"⏱ Последнее обновление: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
+        reply_markup=get_main_keyboard()
+    )
+
+async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    started = await _start_monitoring_for_chat(chat_id, context)
+    if started:
+        await update.message.reply_text("✅ Мониторинг запущен.", reply_markup=get_main_keyboard())
+    else:
+        await update.message.reply_text("⚠️ Мониторинг уже активен.", reply_markup=get_main_keyboard())
+
 async def stop_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if context.job_queue is None:
-        await update.message.reply_text("❌ Ошибка: JobQueue не установлена.")
-        return
     jobs = context.job_queue.get_jobs_by_name(str(chat_id))
     if not jobs:
-        await update.message.reply_text("ℹ️ Мониторинг не активен.")
+        await update.message.reply_text("ℹ️ Мониторинг не активен", reply_markup=get_main_keyboard())
         return
     for job in jobs:
         job.schedule_removal()
     tracker.active_chats.discard(chat_id)
     if not tracker.active_chats:
         tracker.tracked_aircrafts.clear()
-    await update.message.reply_text("⛔ Мониторинг остановлен.", reply_markup=get_main_keyboard())
+    await update.message.reply_text("⛔ Мониторинг остановлен", reply_markup=get_main_keyboard())
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    is_active = False
-    if context.job_queue:
-        is_active = any(job.name == str(chat_id) for job in context.job_queue.jobs())
-    status_text = "активен" if is_active else "не активен"
-    selected = UserPreferences.get_regions(user_id)
-    all_regions = get_all_regions_for_user(user_id)
-    region_names = [all_regions.get(r, {}).get('name', r) for r in selected] if selected else ["не выбраны"]
-    await update.message.reply_text(
-        f"📊 *Статус трекера*\n"
-        f"▫️ В этом чате: {status_text}\n"
-        f"▫️ Отслежено бортов всего: {len(tracker.tracked_aircrafts)}\n"
-        f"▫️ Активных чатов: {len(tracker.active_chats)}\n"
-        f"▫️ Выбранные районы: {', '.join(region_names)}",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
-    )
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Используйте кнопки ⬇️", reply_markup=get_main_keyboard())
 
-async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "⚙️ *Настройки*\n"
-        "Выберите параметр для изменения.",
-        parse_mode="Markdown",
-        reply_markup=get_settings_keyboard()
-    )
+# -------------------- HTTP-HEALTHCHECK ДЛЯ RAILWAY --------------------
+# Это простой веб-сервер, который отвечает на запросы, чтобы Railway считал приложение живым.
+# Запускается в отдельном потоке.
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-async def region_management_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🗺 *Управление районами*\n"
-        "Вы можете выбрать существующие, создать свои или удалить.",
-        parse_mode="Markdown",
-        reply_markup=get_region_management_keyboard()
-    )
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"OK")
 
-# ==================== ВЫБОР РАЙОНОВ ====================
-async def regions_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    await update.message.reply_text(
-        "🗺 Выберите районы для отслеживания:\n"
-        "Нажмите на кнопку, чтобы включить/выключить.",
-        reply_markup=await get_region_keyboard(user_id)
-    )
+def run_health_server(port=8080):
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    logger.info(f"Healthcheck сервер запущен на порту {port}")
+    server.serve_forever()
 
-async def get_region_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    selected = UserPreferences.get_regions(user_id)
-    all_regions = get_all_regions_for_user(user_id)
-    keyboard = []
-    for key, region in all_regions.items():
-        status = "✅" if key in selected else "⬜"
-        button_text = f"{status} {region['name']}"
-        callback_data = f"region_toggle_{key}"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
-    keyboard.append([
-        InlineKeyboardButton("✅ Выбрать все", callback_data="region_select_all"),
-        InlineKeyboardButton("⬜ Сбросить все", callback_data="region_deselect_all")
-    ])
-    keyboard.append([InlineKeyboardButton("◀️ Назад в управление районами", callback_data="region_back_to_management")])
-    return InlineKeyboardMarkup(keyboard)
-
-async def regions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    data = query.data
-
-    if data == "region_back_to_management":
-        await query.answer()
-        await query.message.delete()
-        await query.message.reply_text("Управление районами", reply_markup=get_region_management_keyboard())
-        return
-
-    selected = UserPreferences.get_regions(user_id)
-    new_selected = selected.copy()
-
-    if data == "region_select_all":
-        all_regions = get_all_regions_for_user(user_id)
-        new_selected = set(all_regions.keys())
-    elif data == "region_deselect_all":
-        new_selected = set()
-    elif data.startswith("region_toggle_"):
-        key = data.split("_")[2]
-        if key in new_selected:
-            new_selected.remove(key)
-        else:
-            new_selected.add(key)
-    else:
-        await query.answer("Неизвестная команда")
-        return
-
-    if new_selected != selected:
-        UserPreferences.set_regions(user_id, new_selected)
-        new_markup = await get_region_keyboard(user_id)
-        try:
-            await query.message.edit_reply_markup(reply_markup=new_markup)
-            await query.answer("✅ Обновлено")
-        except Exception as e:
-            if "Message is not modified" in str(e):
-                await query.answer("Ничего не изменилось")
-            else:
-                logger.error(f"Ошибка обновления клавиатуры: {e}")
-                await query.answer("❌ Ошибка обновления")
-    else:
-        if data == "region_select_all":
-            await query.answer("Уже выбраны все районы")
-        elif data == "region_deselect_all":
-            await query.answer("Все районы уже сброшены")
-        else:
-            await query.answer("Ничего не изменилось")
-
-# ==================== СОЗДАНИЕ РАЙОНА ====================
-async def create_region_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🔧 *Создание нового района*\n\n"
-        "Сначала введите название района (например, 'Моя зона').\n"
-        "Затем вы будете добавлять прямоугольники (границы).\n"
-        "Каждый прямоугольник задаётся четырьмя числами:\n"
-        "`min_lat max_lat min_lon max_lon`\n\n"
-        "Пример: `30 40 20 30` означает зону от 30° до 40° с.ш. и от 20° до 30° в.д.\n"
-        "Вы можете добавить несколько прямоугольников для одного района.\n"
-        "Для завершения введите слово `готово`.\n\n"
-        "Введите название:",
-        parse_mode="Markdown",
-        reply_markup=get_cancel_keyboard()
-    )
-    return CREATE_REGION_NAME
-
-async def create_region_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "❌ Отмена":
-        await update.message.reply_text("Отменено.", reply_markup=get_region_management_keyboard())
-        return ConversationHandler.END
-    if not text.strip():
-        await update.message.reply_text("❌ Название не может быть пустым. Попробуйте ещё раз.")
-        return CREATE_REGION_NAME
-    context.user_data['new_region_name'] = text.strip()
-    context.user_data['new_region_boxes'] = []
-    await update.message.reply_text(
-        f"Название: *{text.strip()}*\n\n"
-        "Теперь введите координаты первого прямоугольника.\n"
-        "Формат: `min_lat max_lat min_lon max_lon`\n"
-        "Пример: `30 40 20 30`\n"
-        "После ввода прямоугольника вы сможете добавить ещё или завершить.\n\n"
-        "Введите координаты или `готово` для завершения:",
-        parse_mode="Markdown",
-        reply_markup=get_cancel_keyboard()
-    )
-    return CREATE_REGION_BOX
-
-async def create_region_box(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "❌ Отмена":
-        await update.message.reply_text("Отменено.", reply_markup=get_region_management_keyboard())
-        return ConversationHandler.END
-
-    if text.lower() == "готово":
-        boxes = context.user_data.get('new_region_boxes', [])
-        if not boxes:
-            await update.message.reply_text("❌ Вы не добавили ни одного прямоугольника. Отмена.")
-            return ConversationHandler.END
-        user_id = update.effective_user.id
-        name = context.user_data['new_region_name']
-        region_key = f"custom_{user_id}_{uuid.uuid4().hex[:8]}"
-        region_data = {
-            "name": f"🛩 {name}",
-            "description": f"Пользовательский район: {name}",
-            "boxes": boxes
-        }
-        CustomRegionManager.add_region(user_id, region_key, region_data)
-        UserPreferences.add_region(user_id, region_key)
-        await update.message.reply_text(
-            f"✅ Район '{name}' создан и добавлен в ваши выбранные районы.\n"
-            f"Добавлено прямоугольников: {len(boxes)}",
-            reply_markup=get_region_management_keyboard()
-        )
-        return ConversationHandler.END
-
-    try:
-        parts = text.split()
-        if len(parts) != 4:
-            await update.message.reply_text(
-                "❌ Нужно ровно 4 числа: `min_lat max_lat min_lon max_lon`\n"
-                "Пример: `30 40 20 30`",
-                parse_mode="Markdown"
-            )
-            return CREATE_REGION_BOX
-        min_lat, max_lat, min_lon, max_lon = map(float, parts)
-        if min_lat >= max_lat:
-            await update.message.reply_text("❌ Минимальная широта должна быть меньше максимальной.")
-            return CREATE_REGION_BOX
-        if min_lon >= max_lon:
-            await update.message.reply_text("❌ Минимальная долгота должна быть меньше максимальной.")
-            return CREATE_REGION_BOX
-        if not (-90 <= min_lat <= 90) or not (-90 <= max_lat <= 90):
-            await update.message.reply_text("❌ Широта должна быть в пределах [-90, 90].")
-            return CREATE_REGION_BOX
-        if not (-180 <= min_lon <= 180) or not (-180 <= max_lon <= 180):
-            await update.message.reply_text("❌ Долгота должна быть в пределах [-180, 180].")
-            return CREATE_REGION_BOX
-
-        context.user_data['new_region_boxes'].append([min_lat, max_lat, min_lon, max_lon])
-        count = len(context.user_data['new_region_boxes'])
-        await update.message.reply_text(
-            f"✅ Прямоугольник {count} добавлен: {min_lat}..{max_lat}° с.ш., {min_lon}..{max_lon}° в.д.\n"
-            f"Всего прямоугольников: {count}\n"
-            "Введите следующий прямоугольник или `готово` для завершения.",
-            parse_mode="Markdown"
-        )
-        return CREATE_REGION_BOX
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Неверный формат. Введите 4 числа через пробел.\n"
-            "Пример: `30 40 20 30`",
-            parse_mode="Markdown"
-        )
-        return CREATE_REGION_BOX
-
-# ==================== УДАЛЕНИЕ РАЙОНА ====================
-async def delete_region_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    custom = CustomRegionManager.get_user_regions(user_id)
-    if not custom:
-        await update.message.reply_text("У вас нет пользовательских районов.", reply_markup=get_region_management_keyboard())
-        return ConversationHandler.END
-    keyboard = get_remove_region_keyboard(custom)
-    await update.message.reply_text(
-        "Выберите район для удаления:",
-        reply_markup=keyboard
-    )
-    return DELETE_REGION
-
-async def delete_region_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "◀️ Назад":
-        await update.message.reply_text("Возврат.", reply_markup=get_region_management_keyboard())
-        return ConversationHandler.END
-    if text.startswith("❌ "):
-        name = text[2:].strip()
-        user_id = update.effective_user.id
-        custom = CustomRegionManager.get_user_regions(user_id)
-        found_key = None
-        for key, reg in custom.items():
-            if reg['name'] == name:
-                found_key = key
-                break
-        if found_key:
-            CustomRegionManager.remove_region(user_id, found_key)
-            UserPreferences.remove_region(user_id, found_key)
-            await update.message.reply_text(f"✅ Район '{name}' удалён.", reply_markup=get_region_management_keyboard())
-        else:
-            await update.message.reply_text(f"❌ Район '{name}' не найден.", reply_markup=get_region_management_keyboard())
-        return ConversationHandler.END
-    await update.message.reply_text("Используйте кнопки.")
-    return DELETE_REGION
-
-async def list_my_regions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    all_regions = get_all_regions_for_user(user_id)
-    selected = UserPreferences.get_regions(user_id)
-    if not all_regions:
-        await update.message.reply_text("Нет доступных районов.", reply_markup=get_region_management_keyboard())
-        return
-    text = "📋 *Ваши районы:*\n\n"
-    for key, reg in all_regions.items():
-        status = "✅" if key in selected else "⬜"
-        text += f"{status} {reg['name']}\n"
-        if reg.get('description'):
-            text += f"   {reg['description']}\n"
-    text += "\nВыберите районы через '✏️ Выбрать районы'."
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_region_management_keyboard())
-
-# ==================== НАСТРОЙКА ИНТЕРВАЛА ====================
-async def set_interval_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Введите новый интервал опроса в секундах (минимум 5):",
-        reply_markup=get_cancel_keyboard()
-    )
-    return SET_INTERVAL
-
-async def set_interval_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "❌ Отмена":
-        await update.message.reply_text("Отменено.", reply_markup=get_settings_keyboard())
-        return ConversationHandler.END
-    try:
-        val = int(text.strip())
-        if val < 5:
-            await update.message.reply_text("❌ Минимум 5 секунд. Попробуйте ещё раз.")
-            return SET_INTERVAL
-        config = ConfigManager.load()
-        config["interval_seconds"] = val
-        ConfigManager.save(config)
-        if context.job_queue:
-            for chat_id in list(tracker.active_chats):
-                jobs = context.job_queue.get_jobs_by_name(str(chat_id))
-                for job in jobs:
-                    job.schedule_removal()
-                context.job_queue.run_repeating(
-                    tracker.monitor,
-                    interval=timedelta(seconds=val),
-                    first=5,
-                    chat_id=chat_id,
-                    name=str(chat_id)
-                )
-        await update.message.reply_text(f"✅ Интервал установлен в {val} секунд.", reply_markup=get_settings_keyboard())
-    except ValueError:
-        await update.message.reply_text("❌ Введите целое число.")
-        return SET_INTERVAL
-    return ConversationHandler.END
-
-# ==================== НАСТРОЙКА ВРЕМЕНИ ЖИЗНИ ====================
-async def set_expiry_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Введите время жизни записи о борте в минутах (минимум 1):",
-        reply_markup=get_cancel_keyboard()
-    )
-    return SET_EXPIRY
-
-async def set_expiry_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "❌ Отмена":
-        await update.message.reply_text("Отменено.", reply_markup=get_settings_keyboard())
-        return ConversationHandler.END
-    try:
-        val = int(text.strip())
-        if val < 1:
-            await update.message.reply_text("❌ Минимум 1 минута. Попробуйте ещё раз.")
-            return SET_EXPIRY
-        config = ConfigManager.load()
-        config["expiry_minutes"] = val
-        ConfigManager.save(config)
-        await update.message.reply_text(f"✅ Время жизни установлено в {val} минут.", reply_markup=get_settings_keyboard())
-    except ValueError:
-        await update.message.reply_text("❌ Введите целое число.")
-        return SET_EXPIRY
-    return ConversationHandler.END
-
-# ==================== УПРАВЛЕНИЕ СТРАНАМИ ====================
-async def add_country_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Введите название страны для добавления в фильтр (например, Russia):",
-        reply_markup=get_cancel_keyboard()
-    )
-    return ADD_COUNTRY
-
-async def add_country_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "❌ Отмена":
-        await update.message.reply_text("Отменено.", reply_markup=get_country_keyboard())
-        return ConversationHandler.END
-    country = text.strip()
-    if not country:
-        await update.message.reply_text("❌ Введите название страны.")
-        return ADD_COUNTRY
-    config = ConfigManager.load()
-    allowed = config.get("allowed_countries", [])
-    if country in allowed:
-        await update.message.reply_text(f"ℹ️ Страна '{country}' уже есть в списке.", reply_markup=get_country_keyboard())
-    else:
-        allowed.append(country)
-        config["allowed_countries"] = allowed
-        ConfigManager.save(config)
-        await update.message.reply_text(f"✅ Страна '{country}' добавлена.", reply_markup=get_country_keyboard())
-    return ConversationHandler.END
-
-async def remove_country_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    config = ConfigManager.load()
-    allowed = config.get("allowed_countries", [])
-    if not allowed:
-        await update.message.reply_text("Список стран пуст.", reply_markup=get_country_keyboard())
-        return ConversationHandler.END
-    await update.message.reply_text(
-        "Выберите страну для удаления:",
-        reply_markup=get_remove_country_keyboard(allowed)
-    )
-    return REMOVE_COUNTRY
-
-async def remove_country_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "◀️ Назад":
-        await update.message.reply_text("Возврат.", reply_markup=get_country_keyboard())
-        return ConversationHandler.END
-    if text.startswith("❌ "):
-        country = text[2:].strip()
-        config = ConfigManager.load()
-        allowed = config.get("allowed_countries", [])
-        if country in allowed:
-            allowed.remove(country)
-            config["allowed_countries"] = allowed
-            ConfigManager.save(config)
-            await update.message.reply_text(f"✅ Страна '{country}' удалена.", reply_markup=get_country_keyboard())
-        else:
-            await update.message.reply_text(f"❌ Страна '{country}' не найдена.", reply_markup=get_country_keyboard())
-        return ConversationHandler.END
-    await update.message.reply_text("Используйте кнопки.")
-    return REMOVE_COUNTRY
-
-async def list_countries(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    config = ConfigManager.load()
-    allowed = config.get("allowed_countries", [])
-    if allowed:
-        await update.message.reply_text(
-            "🌍 Фильтруемые страны:\n" + "\n".join(allowed),
-            reply_markup=get_country_keyboard()
-        )
-    else:
-        await update.message.reply_text(
-            "🌍 Фильтр по странам не активен (отслеживаются все).",
-            reply_markup=get_country_keyboard()
-        )
-
-# ==================== УПРАВЛЕНИЕ ТИПАМИ ====================
-async def add_exact_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Введите точный тип (например, C17):",
-        reply_markup=get_cancel_keyboard()
-    )
-    return ADD_EXACT
-
-async def add_exact_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "❌ Отмена":
-        await update.message.reply_text("Отменено.", reply_markup=get_type_keyboard())
-        return ConversationHandler.END
-    typ = text.strip().upper()
-    if not typ:
-        await update.message.reply_text("❌ Введите тип.")
-        return ADD_EXACT
-    config = ConfigManager.load()
-    exact = config.get("target_exact", [])
-    if typ in exact:
-        await update.message.reply_text(f"ℹ️ Тип '{typ}' уже есть.", reply_markup=get_type_keyboard())
-    else:
-        exact.append(typ)
-        config["target_exact"] = exact
-        ConfigManager.save(config)
-        await update.message.reply_text(f"✅ Точный тип '{typ}' добавлен.", reply_markup=get_type_keyboard())
-    return ConversationHandler.END
-
-async def remove_exact_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    config = ConfigManager.load()
-    exact = config.get("target_exact", [])
-    if not exact:
-        await update.message.reply_text("Список точных типов пуст.", reply_markup=get_type_keyboard())
-        return ConversationHandler.END
-    await update.message.reply_text(
-        "Выберите точный тип для удаления:",
-        reply_markup=get_remove_type_keyboard(exact)
-    )
-    return REMOVE_EXACT
-
-async def remove_exact_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "◀️ Назад":
-        await update.message.reply_text("Возврат.", reply_markup=get_type_keyboard())
-        return ConversationHandler.END
-    if text.startswith("❌ "):
-        typ = text[2:].strip()
-        config = ConfigManager.load()
-        exact = config.get("target_exact", [])
-        if typ in exact:
-            exact.remove(typ)
-            config["target_exact"] = exact
-            ConfigManager.save(config)
-            await update.message.reply_text(f"✅ Точный тип '{typ}' удалён.", reply_markup=get_type_keyboard())
-        else:
-            await update.message.reply_text(f"❌ Тип '{typ}' не найден.", reply_markup=get_type_keyboard())
-        return ConversationHandler.END
-    await update.message.reply_text("Используйте кнопки.")
-    return REMOVE_EXACT
-
-async def add_partial_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Введите частичный тип (например, KC135R):",
-        reply_markup=get_cancel_keyboard()
-    )
-    return ADD_PARTIAL
-
-async def add_partial_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "❌ Отмена":
-        await update.message.reply_text("Отменено.", reply_markup=get_type_keyboard())
-        return ConversationHandler.END
-    typ = text.strip().upper()
-    if not typ:
-        await update.message.reply_text("❌ Введите тип.")
-        return ADD_PARTIAL
-    config = ConfigManager.load()
-    partial = config.get("target_partial", [])
-    if typ in partial:
-        await update.message.reply_text(f"ℹ️ Тип '{typ}' уже есть.", reply_markup=get_type_keyboard())
-    else:
-        partial.append(typ)
-        config["target_partial"] = partial
-        ConfigManager.save(config)
-        await update.message.reply_text(f"✅ Частичный тип '{typ}' добавлен.", reply_markup=get_type_keyboard())
-    return ConversationHandler.END
-
-async def remove_partial_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    config = ConfigManager.load()
-    partial = config.get("target_partial", [])
-    if not partial:
-        await update.message.reply_text("Список частичных типов пуст.", reply_markup=get_type_keyboard())
-        return ConversationHandler.END
-    await update.message.reply_text(
-        "Выберите частичный тип для удаления:",
-        reply_markup=get_remove_type_keyboard(partial)
-    )
-    return REMOVE_PARTIAL
-
-async def remove_partial_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "◀️ Назад":
-        await update.message.reply_text("Возврат.", reply_markup=get_type_keyboard())
-        return ConversationHandler.END
-    if text.startswith("❌ "):
-        typ = text[2:].strip()
-        config = ConfigManager.load()
-        partial = config.get("target_partial", [])
-        if typ in partial:
-            partial.remove(typ)
-            config["target_partial"] = partial
-            ConfigManager.save(config)
-            await update.message.reply_text(f"✅ Частичный тип '{typ}' удалён.", reply_markup=get_type_keyboard())
-        else:
-            await update.message.reply_text(f"❌ Тип '{typ}' не найден.", reply_markup=get_type_keyboard())
-        return ConversationHandler.END
-    await update.message.reply_text("Используйте кнопки.")
-    return REMOVE_PARTIAL
-
-async def list_types(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    config = ConfigManager.load()
-    exact = config.get("target_exact", [])
-    partial = config.get("target_partial", [])
-    text = "📋 Текущие списки типов:\n\n"
-    text += "Точные:\n" + (", ".join(exact) if exact else " (пусто)")
-    text += "\n\nЧастичные:\n" + (", ".join(partial) if partial else " (пусто)")
-    await update.message.reply_text(text, reply_markup=get_type_keyboard())
-
-# ==================== НАВИГАЦИЯ ====================
-async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Главное меню", reply_markup=get_main_keyboard())
-
-async def back_to_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Настройки", reply_markup=get_settings_keyboard())
-
-async def back_to_country_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Управление странами", reply_markup=get_country_keyboard())
-
-async def back_to_type_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Управление типами", reply_markup=get_type_keyboard())
-
-# ==================== НЕИЗВЕСТНЫЕ КОМАНДЫ ====================
-async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Используйте кнопки для управления.",
-        reply_markup=get_main_keyboard()
-    )
-
-# ==================== ЗАПУСК ====================
-async def main_async():
+# -------------------- ЗАПУСК --------------------
+def main():
     global tracker
+
+    # Запускаем healthcheck в фоновом потоке
+    health_thread = threading.Thread(target=run_health_server, args=(8080,), daemon=True)
+    health_thread.start()
+
     db = AircraftDatabase()
-    await db.load_async()
+    db.load_sync()
 
     tracker = AircraftTracker(db)
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(Config.BOT_TOKEN).build()
 
-    # Команды
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("monitor", start_monitoring))
+    application.add_handler(CommandHandler("stop", stop_monitoring))
 
-    # Кнопки
-    app.add_handler(MessageHandler(filters.Text("🟢 Запустить мониторинг"), start_monitoring))
-    app.add_handler(MessageHandler(filters.Text("🔴 Остановить мониторинг"), stop_monitoring))
-    app.add_handler(MessageHandler(filters.Text("📊 Статус"), status))
-    app.add_handler(MessageHandler(filters.Text("⚙️ Настройки"), settings_menu))
-    app.add_handler(MessageHandler(filters.Text("◀️ Главное меню"), back_to_main))
-    app.add_handler(MessageHandler(filters.Text("◀️ Назад в настройки"), back_to_settings))
-    app.add_handler(MessageHandler(filters.Text("🌍 Фильтр по странам"), back_to_country_menu))
-    app.add_handler(MessageHandler(filters.Text("✈️ Управление типами"), back_to_type_menu))
-    app.add_handler(MessageHandler(filters.Text("🗺 Мои районы"), region_management_menu))
-    app.add_handler(MessageHandler(filters.Text("✏️ Выбрать районы"), regions_menu))
-    app.add_handler(MessageHandler(filters.Text("➕ Создать район"), create_region_start))
-    app.add_handler(MessageHandler(filters.Text("🗑 Удалить район"), delete_region_start))
-    app.add_handler(MessageHandler(filters.Text("📋 Мои районы"), list_my_regions))
-    app.add_handler(MessageHandler(filters.Text("📋 Список стран"), list_countries))
-    app.add_handler(MessageHandler(filters.Text("📋 Список типов"), list_types))
+    application.add_handler(MessageHandler(filters.Text("🟢 Запустить мониторинг"), start_monitoring))
+    application.add_handler(MessageHandler(filters.Text("🔴 Остановить"), stop_monitoring))
+    application.add_handler(MessageHandler(filters.Text("📊 Статус"), status))
+    application.add_handler(MessageHandler(filters.ALL, unknown_command))
 
-    # Callback для районов
-    app.add_handler(CallbackQueryHandler(regions_callback, pattern="^region_"))
-
-    # Conversation
-    conv_interval = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("⏱ Интервал опроса"), set_interval_start)],
-        states={SET_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_interval_receive)]},
-        fallbacks=[MessageHandler(filters.Text("❌ Отмена"), set_interval_receive)],
-        allow_reentry=True,
-    )
-    app.add_handler(conv_interval)
-
-    conv_expiry = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("⏳ Время жизни записи"), set_expiry_start)],
-        states={SET_EXPIRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_expiry_receive)]},
-        fallbacks=[MessageHandler(filters.Text("❌ Отмена"), set_expiry_receive)],
-        allow_reentry=True,
-    )
-    app.add_handler(conv_expiry)
-
-    conv_add_country = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("➕ Добавить страну"), add_country_start)],
-        states={ADD_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_country_receive)]},
-        fallbacks=[MessageHandler(filters.Text("❌ Отмена"), add_country_receive)],
-        allow_reentry=True,
-    )
-    app.add_handler(conv_add_country)
-
-    conv_remove_country = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("➖ Удалить страну"), remove_country_start)],
-        states={REMOVE_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_country_receive)]},
-        fallbacks=[MessageHandler(filters.Text("◀️ Назад"), remove_country_receive)],
-        allow_reentry=True,
-    )
-    app.add_handler(conv_remove_country)
-
-    conv_add_exact = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("➕ Добавить точный тип"), add_exact_start)],
-        states={ADD_EXACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_exact_receive)]},
-        fallbacks=[MessageHandler(filters.Text("❌ Отмена"), add_exact_receive)],
-        allow_reentry=True,
-    )
-    app.add_handler(conv_add_exact)
-
-    conv_remove_exact = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("➖ Удалить точный тип"), remove_exact_start)],
-        states={REMOVE_EXACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_exact_receive)]},
-        fallbacks=[MessageHandler(filters.Text("◀️ Назад"), remove_exact_receive)],
-        allow_reentry=True,
-    )
-    app.add_handler(conv_remove_exact)
-
-    conv_add_partial = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("➕ Добавить частичный тип"), add_partial_start)],
-        states={ADD_PARTIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_partial_receive)]},
-        fallbacks=[MessageHandler(filters.Text("❌ Отмена"), add_partial_receive)],
-        allow_reentry=True,
-    )
-    app.add_handler(conv_add_partial)
-
-    conv_remove_partial = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("➖ Удалить частичный тип"), remove_partial_start)],
-        states={REMOVE_PARTIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_partial_receive)]},
-        fallbacks=[MessageHandler(filters.Text("◀️ Назад"), remove_partial_receive)],
-        allow_reentry=True,
-    )
-    app.add_handler(conv_remove_partial)
-
-    app.add_handler(MessageHandler(filters.ALL, unknown))
-
-    # Запуск
-    public_url = os.getenv("RAILWAY_PUBLIC_DOMAIN")
-    if public_url:
-        webhook_url = f"https://{public_url}/{BOT_TOKEN}"
-        logger.info(f"Установка вебхука: {webhook_url}")
-        await app.initialize()
-        await app.start()
-        await app.bot.set_webhook(webhook_url)
-        from aiohttp import web
-        async def handle(request):
-            return await app.process_update(await request.text())
-        app_web = web.Application()
-        app_web.router.add_post(f"/{BOT_TOKEN}", handle)
-        runner = web.AppRunner(app_web)
-        await runner.setup()
-        site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
-        await site.start()
-        logger.info("Бот запущен в режиме вебхука")
-        await asyncio.Event().wait()
-    else:
-        logger.info("Запуск в режиме polling")
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling()
-        await asyncio.Event().wait()
-
-def main():
-    asyncio.run(main_async())
+    logger.info("🚀 Бот запущен")
+    application.run_polling()
 
 if __name__ == "__main__":
     main()

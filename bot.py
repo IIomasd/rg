@@ -1334,11 +1334,7 @@ async def main_async():
 
     tracker = AircraftTracker(db)
 
-    # Создаём приложение с JobQueue
     app = Application.builder().token(BOT_TOKEN).build()
-    # В версии 20+ Application автоматически создаёт JobQueue, но для надёжности проверим
-    # Если всё равно None, можно явно добавить: app.job_queue = JobQueue(app)
-    # Но он должен создаться автоматически, если установлен python-telegram-bot[job-queue]
 
     # Команды
     app.add_handler(CommandHandler("start", start))

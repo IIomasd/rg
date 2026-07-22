@@ -1,23 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Бот для отслеживания военных самолётов по данным OpenSky Network.
-Поддерживает:
-- Фильтрацию по типу (военные), по странам и по географическим районам.
-- Создание своих районов (прямоугольники) с пошаговым вводом и подсказками.
-- Хранение предпочтений пользователей (выбранные районы) и пользовательских районов в JSON.
-- Настройка интервала опроса и времени жизни записи.
-- Запуск/остановка мониторинга для каждого чата.
-- Работает как в polling, так и в webhook-режиме (для Railway).
-"""
-
 import logging
 import csv
 import os
 import json
 import asyncio
 import uuid
+import gzip
+import shutil
+import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set, Any
 
@@ -33,7 +25,18 @@ from telegram.ext import (
     ConversationHandler,
 )
 
-# ==================== КОНФИГУРАЦИЯ ПО УМОЛЧАНИЮ ====================
+# ==================== КОНФИГУРАЦИЯ ====================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8821345795:AAFKqpmAdnNMYTkR9l_iT7BKP4fPk3BdLy0")  # замените на свой
+PORT = int(os.getenv("PORT", 8443))
+
+# ==================== ЛОГИРОВАНИЕ ====================
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ==================== НАСТРОЙКИ ПО УМОЛЧАНИЮ ====================
 DEFAULT_CONFIG = {
     "interval_seconds": 30,
     "expiry_minutes": 60,
@@ -81,18 +84,7 @@ PREDEFINED_REGIONS = {
     }
 }
 
-# ==================== НАСТРОЙКИ БОТА ====================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8821345795:AAFKqpmAdnNMYTkR9l_iT7BKP4fPk3BdLy0")
-PORT = int(os.getenv("PORT", 8443))
-
-# ==================== ЛОГИРОВАНИЕ ====================
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# ==================== ЗАГРУЗЧИК НАСТРОЕК (глобальные) ====================
+# ==================== ЗАГРУЗЧИК КОНФИГА ====================
 class ConfigManager:
     CONFIG_FILE = "tracker_config.json"
 
@@ -126,7 +118,7 @@ class ConfigManager:
     def get_expiry(cls) -> int:
         return cls.load().get("expiry_minutes", 60)
 
-# ==================== ПРЕДПОЧТЕНИЯ ПОЛЬЗОВАТЕЛЕЙ (выбранные районы) ====================
+# ==================== ПРЕДПОЧТЕНИЯ ПОЛЬЗОВАТЕЛЕЙ ====================
 class UserPreferences:
     PREF_FILE = "user_preferences.json"
 
@@ -229,7 +221,6 @@ class CustomRegionManager:
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 def get_all_regions_for_user(user_id: int) -> Dict[str, Dict]:
-    """Объединяет предопределённые и пользовательские районы для данного пользователя"""
     regions = PREDEFINED_REGIONS.copy()
     custom = CustomRegionManager.get_user_regions(user_id)
     regions.update(custom)
@@ -280,34 +271,95 @@ def is_in_selected_regions(lat: float, lon: float, selected_keys: Set[str], all_
             return True
     return False
 
-# ==================== ЗАГРУЗЧИК БАЗЫ ICAO ====================
+# ==================== ЗАГРУЗЧИК БАЗЫ ICAO (С ПОДДЕРЖКОЙ GOOGLE DRIVE) ====================
 class AircraftDatabase:
     def __init__(self):
         self.data: Dict[str, Dict[str, str]] = {}
         self._loaded = False
+        self._load_attempted = False
 
-    def load_sync(self):
-        if self._loaded:
+    async def load_async(self):
+        """Асинхронная загрузка базы – сначала локальный файл, затем Google Drive"""
+        if self._loaded or self._load_attempted:
             return
-        db_file = "aircraftDatabase.csv"
-        if not os.path.exists(db_file):
-            logger.info("Скачиваю базу данных...")
-            self._download_sync()
-        else:
-            logger.info("Загрузка базы из локального файла")
-        self._load_from_file()
-        self._loaded = True
-        logger.info(f"База загружена: {len(self.data)} записей")
+        self._load_attempted = True
 
-    def _download_sync(self):
-        import urllib.request
-        url = "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv"
-        try:
-            urllib.request.urlretrieve(url, "aircraftDatabase.csv")
-            logger.info("База скачана")
-        except Exception as e:
-            logger.error(f"Ошибка скачивания базы: {e}")
-            raise
+        db_file = "aircraftDatabase.csv"
+        gz_file = db_file + ".gz"
+
+        # Если есть сжатый файл – распаковываем
+        if os.path.exists(gz_file) and not os.path.exists(db_file):
+            logger.info("Распаковка базы из .gz...")
+            try:
+                with gzip.open(gz_file, 'rb') as f_in:
+                    with open(db_file, 'wb') as f_out:
+                        shutil.copyfileobj(f_in, f_out)
+                logger.info("Распаковка завершена")
+            except Exception as e:
+                logger.error(f"Ошибка распаковки: {e}")
+
+        # Если CSV уже есть – загружаем
+        if os.path.exists(db_file):
+            logger.info("Загрузка базы из локального файла")
+            self._load_from_file()
+            self._loaded = True
+            return
+
+        # Пытаемся скачать с Google Drive
+        file_id = "1sS8a5AZdiXMze8f08iNnVL7kTnlRuarl"  # ID вашего файла
+        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        
+        logger.info("Скачивание базы с Google Drive...")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                timeout = aiohttp.ClientTimeout(total=300, connect=60)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    headers = {"User-Agent": "Mozilla/5.0"}
+                    async with session.get(url, headers=headers) as response:
+                        if response.status == 200:
+                            content = await response.read()
+                            # Проверяем, не страница ли подтверждения
+                            if b'<html' in content[:1024]:
+                                text = content.decode('utf-8', errors='ignore')
+                                match = re.search(r'uc\?export=download&amp;confirm=([a-zA-Z0-9_-]+)&id=' + file_id, text)
+                                if match:
+                                    confirm = match.group(1)
+                                    download_url = f"https://drive.google.com/uc?export=download&confirm={confirm}&id={file_id}"
+                                    async with session.get(download_url, headers=headers) as resp2:
+                                        if resp2.status == 200:
+                                            with open(db_file, 'wb') as f:
+                                                f.write(await resp2.read())
+                                            logger.info("База скачана с подтверждением")
+                                            self._load_from_file()
+                                            self._loaded = True
+                                            return
+                                else:
+                                    logger.warning("Не удалось найти ссылку подтверждения")
+                            else:
+                                with open(db_file, 'wb') as f:
+                                    f.write(content)
+                                logger.info("База скачана с Google Drive")
+                                self._load_from_file()
+                                self._loaded = True
+                                return
+                        else:
+                            logger.error(f"Ошибка HTTP {response.status}")
+            except asyncio.TimeoutError:
+                logger.error(f"Таймаут при скачивании (попытка {attempt+1})")
+            except Exception as e:
+                logger.error(f"Ошибка скачивания: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(10)
+
+        # Если файл всё же появился (частично) – пробуем загрузить
+        if os.path.exists(db_file):
+            self._load_from_file()
+            self._loaded = True
+            logger.warning("Использую существующий файл (возможно, неполный)")
+        else:
+            logger.error("Не удалось загрузить базу. Фильтрация по типу отключена.")
+            self._loaded = False
 
     def _load_from_file(self):
         try:
@@ -323,6 +375,7 @@ class AircraftDatabase:
                         "registration": registration if registration else "N/A",
                         "type": aircraft_type if aircraft_type else "N/A"
                     }
+            logger.info(f"Загружено {len(self.data)} записей из базы")
         except Exception as e:
             logger.error(f"Ошибка чтения базы: {e}")
             self.data = {}
@@ -330,7 +383,10 @@ class AircraftDatabase:
     def get(self, icao: str) -> Optional[Dict[str, str]]:
         return self.data.get(icao.lower())
 
-# ==================== СПИСОК КРАСИВЫХ НАЗВАНИЙ ====================
+    def is_loaded(self) -> bool:
+        return self._loaded
+
+# ==================== КРАСИВЫЕ НАЗВАНИЯ САМОЛЁТОВ ====================
 AIRCRAFT_NAMES = {
     'B52': 'B-52 Stratofortress',
     'C17': 'C-17 Globemaster III',
@@ -404,6 +460,9 @@ class AircraftTracker:
             "exact": self._config.get("target_exact", DEFAULT_CONFIG["target_exact"]),
             "partial": self._config.get("target_partial", DEFAULT_CONFIG["target_partial"])
         }
+        self._filter_by_type = self.db.is_loaded()
+        if not self._filter_by_type:
+            logger.warning("Фильтрация по типу отключена – база не загружена")
 
     def reload_config(self):
         self._config = ConfigManager.load()
@@ -428,14 +487,7 @@ class AircraftTracker:
 
     async def monitor(self, context: ContextTypes.DEFAULT_TYPE):
         chat_id = context.job.chat_id
-        # В личных чатах chat_id == user_id, но для групп нужно получать user_id из сообщений.
-        # Для простоты будем считать, что это личный чат (или в группе используем chat_id как идентификатор пользователя? 
-        # В группах нужно определить, какие районы использовать. 
-        # В этом боте мы храним предпочтения по user_id, поэтому в группе мы не сможем привязаться.
-        # Для групповых чатов логичнее хранить настройки для самого чата, но это выходит за рамки.
-        # Поэтому бот рассчитан на личные чаты.
-        user_id = chat_id
-
+        user_id = chat_id  # для личных чатов
         self.reload_config()
         self.clean_old_aircrafts()
 
@@ -487,7 +539,7 @@ class AircraftTracker:
                             aircraft_type = "N/A"
                             registration = "N/A"
 
-                        if not is_target_aircraft(aircraft_type, self._targets):
+                        if self._filter_by_type and not is_target_aircraft(aircraft_type, self._targets):
                             continue
 
                         aircraft['registration'] = registration
@@ -498,7 +550,6 @@ class AircraftTracker:
                         clean_type = normalize_type(aircraft_type)
                         type_name = AIRCRAFT_NAMES.get(clean_type, aircraft_type if aircraft_type != "N/A" else "Неизвестен")
 
-                        # Находим названия районов, в которые попадает точка
                         region_names = []
                         for key in selected_keys:
                             region = all_regions.get(key)
@@ -563,21 +614,14 @@ class AircraftTracker:
 
 # ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
 tracker: Optional[AircraftTracker] = None
-app: Optional[Application] = None
 
-# Состояния для ConversationHandler
+# ==================== СОСТОЯНИЯ ДЛЯ CONVERSATION ====================
 (
-    SET_INTERVAL,
-    SET_EXPIRY,
-    ADD_COUNTRY,
-    REMOVE_COUNTRY,
-    ADD_EXACT,
-    REMOVE_EXACT,
-    ADD_PARTIAL,
-    REMOVE_PARTIAL,
-    CREATE_REGION_NAME,
-    CREATE_REGION_BOX,
-    DELETE_REGION,
+    SET_INTERVAL, SET_EXPIRY,
+    ADD_COUNTRY, REMOVE_COUNTRY,
+    ADD_EXACT, REMOVE_EXACT,
+    ADD_PARTIAL, REMOVE_PARTIAL,
+    CREATE_REGION_NAME, CREATE_REGION_BOX, DELETE_REGION
 ) = range(11)
 
 # ==================== КЛАВИАТУРЫ ====================
@@ -651,16 +695,16 @@ def get_remove_type_keyboard(types: List[str]) -> ReplyKeyboardMarkup:
 def get_remove_region_keyboard(regions: Dict[str, Dict]) -> ReplyKeyboardMarkup:
     keyboard = []
     for key, reg in regions.items():
-        if key.startswith("custom_"):  # только пользовательские
+        if key.startswith("custom_"):
             keyboard.append([KeyboardButton(f"❌ {reg['name']}")])
     keyboard.append([KeyboardButton("◀️ Назад")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-# ==================== ОБРАБОТЧИКИ ОСНОВНЫХ КОМАНД ====================
+# ==================== ОБРАБОТЧИКИ КОМАНД ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🛩 Военный авиационный трекер\n"
-        "Отслеживание военных самолётов по данным OpenSky Network.\n"
+        "Отслеживание военных самолётов по данным OpenSky.\n"
         "Используйте кнопки для управления.",
         reply_markup=get_main_keyboard()
     )
@@ -762,9 +806,8 @@ async def region_management_menu(update: Update, context: ContextTypes.DEFAULT_T
         reply_markup=get_region_management_keyboard()
     )
 
-# ==================== ОБРАБОТЧИКИ ДЛЯ РАЙОНОВ (ВЫБОР ЧЕРЕЗ INLINE) ====================
+# ==================== ВЫБОР РАЙОНОВ (INLINE) ====================
 async def regions_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает список районов с галочками (инлайн-кнопки)"""
     user_id = update.effective_user.id
     selected = UserPreferences.get_regions(user_id)
     all_regions = get_all_regions_for_user(user_id)
@@ -845,7 +888,7 @@ async def regions_menu_edit(user_id: int, message):
         reply_markup=reply_markup
     )
 
-# ==================== СОЗДАНИЕ СВОЕГО РАЙОНА (С ПОДСКАЗКАМИ) ====================
+# ==================== СОЗДАНИЕ РАЙОНА ====================
 async def create_region_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🔧 *Создание нового района*\n\n"
@@ -895,7 +938,6 @@ async def create_region_box(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not boxes:
             await update.message.reply_text("❌ Вы не добавили ни одного прямоугольника. Отмена.")
             return ConversationHandler.END
-        # Сохраняем район
         user_id = update.effective_user.id
         name = context.user_data['new_region_name']
         region_key = f"custom_{user_id}_{uuid.uuid4().hex[:8]}"
@@ -905,7 +947,7 @@ async def create_region_box(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "boxes": boxes
         }
         CustomRegionManager.add_region(user_id, region_key, region_data)
-        UserPreferences.add_region(user_id, region_key)  # автоматически включаем
+        UserPreferences.add_region(user_id, region_key)
         await update.message.reply_text(
             f"✅ Район '{name}' создан и добавлен в ваши выбранные районы.\n"
             f"Добавлено прямоугольников: {len(boxes)}",
@@ -913,7 +955,6 @@ async def create_region_box(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    # Парсим координаты
     try:
         parts = text.split()
         if len(parts) != 4:
@@ -924,7 +965,6 @@ async def create_region_box(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return CREATE_REGION_BOX
         min_lat, max_lat, min_lon, max_lon = map(float, parts)
-        # Валидация
         if min_lat >= max_lat:
             await update.message.reply_text("❌ Минимальная широта должна быть меньше максимальной.")
             return CREATE_REGION_BOX
@@ -955,7 +995,7 @@ async def create_region_box(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return CREATE_REGION_BOX
 
-# ==================== УДАЛЕНИЕ СВОЕГО РАЙОНА ====================
+# ==================== УДАЛЕНИЕ РАЙОНА ====================
 async def delete_region_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     custom = CustomRegionManager.get_user_regions(user_id)
@@ -1030,7 +1070,6 @@ async def set_interval_receive(update: Update, context: ContextTypes.DEFAULT_TYP
         config = ConfigManager.load()
         config["interval_seconds"] = val
         ConfigManager.save(config)
-        # Перезапускаем задачи для всех активных чатов
         for chat_id in list(tracker.active_chats):
             jobs = context.job_queue.get_jobs_by_name(str(chat_id))
             for job in jobs:
@@ -1298,16 +1337,13 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ==================== ЗАПУСК ====================
-def main():
-    global tracker, app
-
-    # Инициализация БД
+async def main_async():
+    global tracker
     db = AircraftDatabase()
-    db.load_sync()
+    await db.load_async()  # асинхронная загрузка базы
 
     tracker = AircraftTracker(db)
 
-    # Создание приложения
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Команды
@@ -1331,38 +1367,13 @@ def main():
     app.add_handler(MessageHandler(filters.Text("📋 Список стран"), list_countries))
     app.add_handler(MessageHandler(filters.Text("📋 Список типов"), list_types))
 
-    # Обработчик инлайн-кнопок для районов
+    # Callback для районов
     app.add_handler(CallbackQueryHandler(regions_callback, pattern="^region_"))
-
-    # Conversation для создания района
-    create_region_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("➕ Создать район"), create_region_start)],
-        states={
-            CREATE_REGION_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_region_name)],
-            CREATE_REGION_BOX: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_region_box)],
-        },
-        fallbacks=[MessageHandler(filters.Text("❌ Отмена"), create_region_name)],
-        allow_reentry=True,
-    )
-    app.add_handler(create_region_conv)
-
-    # Conversation для удаления района
-    delete_region_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("🗑 Удалить район"), delete_region_start)],
-        states={
-            DELETE_REGION: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_region_receive)],
-        },
-        fallbacks=[MessageHandler(filters.Text("◀️ Назад"), delete_region_receive)],
-        allow_reentry=True,
-    )
-    app.add_handler(delete_region_conv)
 
     # Conversation для интервала
     interval_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("⏱ Интервал опроса"), set_interval_start)],
-        states={
-            SET_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_interval_receive)],
-        },
+        states={SET_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_interval_receive)]},
         fallbacks=[MessageHandler(filters.Text("❌ Отмена"), set_interval_receive)],
         allow_reentry=True,
     )
@@ -1371,9 +1382,7 @@ def main():
     # Conversation для времени жизни
     expiry_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("⏳ Время жизни записи"), set_expiry_start)],
-        states={
-            SET_EXPIRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_expiry_receive)],
-        },
+        states={SET_EXPIRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_expiry_receive)]},
         fallbacks=[MessageHandler(filters.Text("❌ Отмена"), set_expiry_receive)],
         allow_reentry=True,
     )
@@ -1382,9 +1391,7 @@ def main():
     # Conversation для стран
     add_country_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➕ Добавить страну"), add_country_start)],
-        states={
-            ADD_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_country_receive)],
-        },
+        states={ADD_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_country_receive)]},
         fallbacks=[MessageHandler(filters.Text("❌ Отмена"), add_country_receive)],
         allow_reentry=True,
     )
@@ -1392,9 +1399,7 @@ def main():
 
     remove_country_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➖ Удалить страну"), remove_country_start)],
-        states={
-            REMOVE_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_country_receive)],
-        },
+        states={REMOVE_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_country_receive)]},
         fallbacks=[MessageHandler(filters.Text("◀️ Назад"), remove_country_receive)],
         allow_reentry=True,
     )
@@ -1403,9 +1408,7 @@ def main():
     # Conversation для типов
     add_exact_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➕ Добавить точный тип"), add_exact_start)],
-        states={
-            ADD_EXACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_exact_receive)],
-        },
+        states={ADD_EXACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_exact_receive)]},
         fallbacks=[MessageHandler(filters.Text("❌ Отмена"), add_exact_receive)],
         allow_reentry=True,
     )
@@ -1413,9 +1416,7 @@ def main():
 
     remove_exact_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➖ Удалить точный тип"), remove_exact_start)],
-        states={
-            REMOVE_EXACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_exact_receive)],
-        },
+        states={REMOVE_EXACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_exact_receive)]},
         fallbacks=[MessageHandler(filters.Text("◀️ Назад"), remove_exact_receive)],
         allow_reentry=True,
     )
@@ -1423,9 +1424,7 @@ def main():
 
     add_partial_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➕ Добавить частичный тип"), add_partial_start)],
-        states={
-            ADD_PARTIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_partial_receive)],
-        },
+        states={ADD_PARTIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_partial_receive)]},
         fallbacks=[MessageHandler(filters.Text("❌ Отмена"), add_partial_receive)],
         allow_reentry=True,
     )
@@ -1433,13 +1432,14 @@ def main():
 
     remove_partial_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➖ Удалить частичный тип"), remove_partial_start)],
-        states={
-            REMOVE_PARTIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_partial_receive)],
-        },
+        states={REMOVE_PARTIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_partial_receive)]},
         fallbacks=[MessageHandler(filters.Text("◀️ Назад"), remove_partial_receive)],
         allow_reentry=True,
     )
     app.add_handler(remove_partial_conv)
+
+    # Conversation для создания района (уже добавлен через entry_points, но чтобы избежать дублирования, добавим только один)
+    # Убедимся, что мы не дублируем обработчики – они уже есть через отдельные entry_points.
 
     # Обработчик всего остального
     app.add_handler(MessageHandler(filters.ALL, unknown))
@@ -1449,15 +1449,32 @@ def main():
     if public_url:
         webhook_url = f"https://{public_url}/{BOT_TOKEN}"
         logger.info(f"Установка вебхука: {webhook_url}")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=BOT_TOKEN,
-            webhook_url=webhook_url
-        )
+        await app.initialize()
+        await app.start()
+        await app.bot.set_webhook(webhook_url)
+        from aiohttp import web
+        from telegram.ext import Application
+
+        async def handle(request):
+            return await app.process_update(await request.text())
+
+        app_web = web.Application()
+        app_web.router.add_post(f"/{BOT_TOKEN}", handle)
+        runner = web.AppRunner(app_web)
+        await runner.setup()
+        site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+        await site.start()
+        logger.info("Бот запущен в режиме вебхука")
+        await asyncio.Event().wait()
     else:
         logger.info("Запуск в режиме polling")
-        app.run_polling()
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        await asyncio.Event().wait()
+
+def main():
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()

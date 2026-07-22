@@ -21,13 +21,13 @@ class Config:
     DATABASE_URL = "https://drive.google.com/uc?export=download&id=1sS8a5AZdiXMze8f08iNnVL7kTnlRuarl"
     FALLBACK_DATABASE_URL = "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv"
     LOCAL_DB_FILE = "aircraftDatabase.csv"
-    MONITOR_INTERVAL = 30
-    REQUEST_TIMEOUT = 120
+    MONITOR_INTERVAL = 60          # увеличен
+    REQUEST_TIMEOUT = 180          # увеличен
     DB_DOWNLOAD_TIMEOUT = 90
     DB_RETRY_ATTEMPTS = 3
     DB_RETRY_DELAY = 5
 
-# -------------------- ДАННЫЕ --------------------
+# -------------------- ДАННЫЕ (без изменений) --------------------
 AIRCRAFT_NAMES = {
     'B52': 'B-52 Stratofortress',
     'C17': 'C-17 Globemaster III',
@@ -242,7 +242,12 @@ class AircraftTracker:
     async def monitor(self, context: ContextTypes.DEFAULT_TYPE):
         chat_id = context.job.chat_id
         try:
-            timeout = aiohttp.ClientTimeout(total=Config.REQUEST_TIMEOUT, connect=30, sock_read=60)
+            # Увеличиваем таймауты
+            timeout = aiohttp.ClientTimeout(
+                total=Config.REQUEST_TIMEOUT,
+                connect=30,
+                sock_read=Config.REQUEST_TIMEOUT   # теперь 180 секунд
+            )
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 logger.info(f"📡 Запрос к {Config.API_URL}")
                 async with session.get(Config.API_URL) as response:
@@ -363,7 +368,8 @@ async def _start_monitoring_for_chat(chat_id: int, context: ContextTypes.DEFAULT
         interval=timedelta(seconds=Config.MONITOR_INTERVAL),
         first=5,
         chat_id=chat_id,
-        name=str(chat_id)
+        name=str(chat_id),
+        job_kwargs={'max_instances': 1}   # предотвращает накопление задач
     )
     tracker.active_chats.add(chat_id)
     return True

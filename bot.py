@@ -1344,6 +1344,7 @@ async def main_async():
 
     tracker = AircraftTracker(db)
 
+    # Используем глобальный импорт Application
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Команды
@@ -1438,9 +1439,6 @@ async def main_async():
     )
     app.add_handler(remove_partial_conv)
 
-    # Conversation для создания района (уже добавлен через entry_points, но чтобы избежать дублирования, добавим только один)
-    # Убедимся, что мы не дублируем обработчики – они уже есть через отдельные entry_points.
-
     # Обработчик всего остального
     app.add_handler(MessageHandler(filters.ALL, unknown))
 
@@ -1452,12 +1450,10 @@ async def main_async():
         await app.initialize()
         await app.start()
         await app.bot.set_webhook(webhook_url)
+        # Для вебхука используем aiohttp, но не импортируем Application повторно
         from aiohttp import web
-        from telegram.ext import Application
-
         async def handle(request):
             return await app.process_update(await request.text())
-
         app_web = web.Application()
         app_web.router.add_post(f"/{BOT_TOKEN}", handle)
         runner = web.AppRunner(app_web)
@@ -1465,7 +1461,7 @@ async def main_async():
         site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
         await site.start()
         logger.info("Бот запущен в режиме вебхука")
-        await asyncio.Event().wait()
+        await asyncio.Event().wait()  # бесконечное ожидание
     else:
         logger.info("Запуск в режиме polling")
         await app.initialize()

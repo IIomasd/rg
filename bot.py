@@ -800,7 +800,7 @@ async def region_management_menu(update: Update, context: ContextTypes.DEFAULT_T
         reply_markup=get_region_management_keyboard()
     )
 
-# ==================== ВЫБОР РАЙОНОВ (INLINE) — ИСПРАВЛЕННЫЕ ФУНКЦИИ ====================
+# ==================== ВЫБОР РАЙОНОВ (INLINE) — ИСПРАВЛЕННЫЙ ====================
 async def regions_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     selected = UserPreferences.get_regions(user_id)
@@ -859,16 +859,14 @@ async def regions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("region_toggle_"):
         key = data.split("_")[2]
-        selected = UserPreferences.get_regions(user_id)
-        changed = False
-        if key in selected:
-            selected.remove(key)
-            changed = True
+        old_selected = UserPreferences.get_regions(user_id)
+        new_selected = old_selected.copy()
+        if key in new_selected:
+            new_selected.remove(key)
         else:
-            selected.add(key)
-            changed = True
-        if changed:
-            UserPreferences.set_regions(user_id, selected)
+            new_selected.add(key)
+        if new_selected != old_selected:
+            UserPreferences.set_regions(user_id, new_selected)
             await regions_menu_edit(user_id, query.message)
         else:
             await query.answer("Ничего не изменилось.")

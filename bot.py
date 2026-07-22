@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 # ==================== НАСТРОЙКИ ПО УМОЛЧАНИЮ ====================
 DEFAULT_CONFIG = {
-    "interval_seconds": 30,
+    "interval_seconds": 60,  # увеличен до 60 секунд
     "expiry_minutes": 60,
     "allowed_countries": [],
     "target_exact": [
@@ -112,7 +112,7 @@ class ConfigManager:
 
     @classmethod
     def get_interval(cls) -> int:
-        return cls.load().get("interval_seconds", 30)
+        return cls.load().get("interval_seconds", 60)
 
     @classmethod
     def get_expiry(cls) -> int:
@@ -486,13 +486,17 @@ class AircraftTracker:
         self.clean_old_aircrafts()
 
         selected_keys = UserPreferences.get_regions(user_id)
-        if not selected_keys:
-            return
-
         all_regions = get_all_regions_for_user(user_id)
 
+        # Логируем выбранные районы
+        logger.info(f"Чат {chat_id}: выбраны районы: {selected_keys}")
+
+        if not selected_keys:
+            logger.info(f"Чат {chat_id}: районы не выбраны, пропускаем")
+            return
+
         try:
-            timeout = aiohttp.ClientTimeout(total=120, connect=30, sock_read=60)
+            timeout = aiohttp.ClientTimeout(total=180, connect=30, sock_read=120)  # увеличен таймаут
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 url = "https://opensky-network.org/api/states/all"
                 async with session.get(url) as response:
@@ -500,8 +504,10 @@ class AircraftTracker:
                     data = await response.json()
                     states = data.get('states', [])
                     if not states:
+                        logger.info(f"Чат {chat_id}: OpenSky вернул пустой список")
                         return
 
+                    logger.info(f"Чат {chat_id}: получено {len(states)} самолётов")
                     allowed_countries = self._config.get("allowed_countries", [])
                     for state in states:
                         aircraft = self.parse_aircraft(state)
@@ -517,7 +523,12 @@ class AircraftTracker:
                         if lat is None or lon is None:
                             continue
 
-                        if not is_in_selected_regions(lat, lon, selected_keys, all_regions):
+                        # Логируем координаты для отладки
+                        logger.debug(f"Самолёт {icao}: lat={lat}, lon={lon}")
+
+                        # Проверяем, попадает ли в выбранные районы
+                        in_region = is_in_selected_regions(lat, lon, selected_keys, all_regions)
+                        if not in_region:
                             continue
 
                         if allowed_countries:
@@ -571,7 +582,7 @@ class AircraftTracker:
                         logger.info(f"✅ Обнаружение: {icao} ({type_name}) в районе {region_str}")
 
         except asyncio.TimeoutError:
-            logger.warning("⏳ Таймаут при запросе к OpenSky")
+            logger.warning("⏳ Таймаут при запросе к OpenSky (превышено 180 сек)")
         except aiohttp.ClientError as e:
             logger.error(f"🌐 Ошибка HTTP: {e}")
         except Exception as e:
@@ -809,7 +820,7 @@ async def region_management_menu(update: Update, context: ContextTypes.DEFAULT_T
         reply_markup=get_region_management_keyboard()
     )
 
-# ==================== ВЫБОР РАЙОНОВ (ИНЛАЙН-КЛАВИАТУРА) ====================
+# ==================== ВЫБОР РАЙОНОВ ====================
 async def regions_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await update.message.reply_text(
@@ -845,7 +856,6 @@ async def regions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Управление районами", reply_markup=get_region_management_keyboard())
         return
 
-    # Получаем текущие выбранные районы
     selected = UserPreferences.get_regions(user_id)
     new_selected = selected.copy()
 
@@ -864,7 +874,6 @@ async def regions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Неизвестная команда")
         return
 
-    # Если изменилось – сохраняем и обновляем клавиатуру
     if new_selected != selected:
         UserPreferences.set_regions(user_id, new_selected)
         new_markup = await get_region_keyboard(user_id)
@@ -878,7 +887,6 @@ async def regions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Ошибка обновления клавиатуры: {e}")
                 await query.answer("❌ Ошибка обновления")
     else:
-        # Если не изменилось – просто уведомляем
         if data == "region_select_all":
             await query.answer("Уже выбраны все районы")
         elif data == "region_deselect_all":

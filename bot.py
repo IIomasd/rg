@@ -7,20 +7,26 @@ import urllib.request
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 import aiohttp
+import requests  # <-- добавлено
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # -------------------- КОНФИГУРАЦИЯ --------------------
 class Config:
-    BOT_TOKEN = os.getenv("BOT_TOKEN")   # токен из переменной окружения
+    BOT_TOKEN = os.getenv("BOT_TOKEN")
     if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN не задан! Установите переменную окружения.")
-    
+        raise ValueError("BOT_TOKEN не задан!")
+
     API_URL = "https://opensky-network.org/api/states/all"
-    DATABASE_URL = "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv"
+    # Используем Google Drive прямую ссылку
+    DATABASE_URL = "https://drive.google.com/uc?export=download&id=1sS8a5AZdiXMze8f08iNnVL7kTnlRuarl"
+    FALLBACK_DATABASE_URL = "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv"
     LOCAL_DB_FILE = "aircraftDatabase.csv"
     MONITOR_INTERVAL = 30
     REQUEST_TIMEOUT = 120
+    DB_DOWNLOAD_TIMEOUT = 90
+    DB_RETRY_ATTEMPTS = 3
+    DB_RETRY_DELAY = 5
 
 # -------------------- ДАННЫЕ --------------------
 AIRCRAFT_NAMES = {
@@ -137,7 +143,7 @@ def is_target_aircraft(aircraft_type: str) -> bool:
             return True
     return False
 
-# -------------------- ЗАГРУЗЧИК БАЗЫ --------------------
+# -------------------- ЗАГРУЗЧИК БАЗЫ (с повторными попытками) --------------------
 class AircraftDatabase:
     def __init__(self):
         self.data: Dict[str, Dict[str, str]] = {}
@@ -147,7 +153,7 @@ class AircraftDatabase:
         if self._loaded:
             return
         if not os.path.exists(Config.LOCAL_DB_FILE):
-            logger.info("Скачиваю базу данных...")
+            logger.info("Скачиваю базу данных с Google Drive...")
             self._download_sync()
         else:
             logger.info("Загрузка базы из локального файла")
@@ -156,12 +162,59 @@ class AircraftDatabase:
         logger.info(f"База загружена: {len(self.data)} записей")
 
     def _download_sync(self):
-        try:
-            urllib.request.urlretrieve(Config.DATABASE_URL, Config.LOCAL_DB_FILE)
-            logger.info("База скачана")
-        except Exception as e:
-            logger.error(f"Ошибка скачивания базы: {e}")
-            raise
+        """Скачивание с повторными попытками, сначала Google Drive, потом fallback."""
+        for attempt in range(1, Config.DB_RETRY_ATTEMPTS + 1):
+            try:
+                logger.info(f"Попытка {attempt} из {Config.DB_RETRY_ATTEMPTS} – скачивание с Google Drive")
+                response = requests.get(
+                    Config.DATABASE_URL,
+                    stream=True,
+                    timeout=Config.DB_DOWNLOAD_TIMEOUT,
+                    allow_redirects=True
+                )
+                if response.status_code == 200:
+                    with open(Config.LOCAL_DB_FILE, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    logger.info("База успешно скачана с Google Drive")
+                    return
+                else:
+                    logger.warning(f"Google Drive ответил {response.status_code}, пробую fallback...")
+                    break  # переходим к fallback
+            except (requests.RequestException, OSError) as e:
+                logger.warning(f"Ошибка при скачивании с Google Drive (попытка {attempt}): {e}")
+                if attempt < Config.DB_RETRY_ATTEMPTS:
+                    import time
+                    time.sleep(Config.DB_RETRY_DELAY * attempt)
+                else:
+                    # Пробуем fallback
+                    logger.info("Попытка скачать с оригинального OpenSky...")
+                    try:
+                        response = requests.get(
+                            Config.FALLBACK_DATABASE_URL,
+                            stream=True,
+                            timeout=Config.DB_DOWNLOAD_TIMEOUT,
+                            allow_redirects=True
+                        )
+                        if response.status_code == 200:
+                            with open(Config.LOCAL_DB_FILE, "wb") as f:
+                                for chunk in response.iter_content(chunk_size=8192):
+                                    if chunk:
+                                        f.write(chunk)
+                            logger.info("База скачана с OpenSky (fallback)")
+                            return
+                        else:
+                            logger.error(f"Fallback вернул {response.status_code}")
+                    except Exception as e2:
+                        logger.error(f"Ошибка fallback: {e2}")
+
+        # Если все попытки провалились
+        logger.error("Не удалось скачать базу данных. Будет использована пустая база.")
+        # Создаём пустой файл, чтобы не пытаться снова при следующем запуске
+        with open(Config.LOCAL_DB_FILE, "w") as f:
+            f.write("icao24,registration,model\n")
+        self.data = {}
 
     def _load_from_file(self):
         try:
@@ -379,8 +432,6 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Используйте кнопки ⬇️", reply_markup=get_main_keyboard())
 
 # -------------------- HTTP-HEALTHCHECK ДЛЯ RAILWAY --------------------
-# Это простой веб-сервер, который отвечает на запросы, чтобы Railway считал приложение живым.
-# Запускается в отдельном потоке.
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -400,7 +451,6 @@ def run_health_server(port=8080):
 def main():
     global tracker
 
-    # Запускаем healthcheck в фоновом потоке
     health_thread = threading.Thread(target=run_health_server, args=(8080,), daemon=True)
     health_thread.start()
 

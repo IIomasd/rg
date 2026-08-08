@@ -50,7 +50,8 @@ class Config:
     DATABASE_URL = "https://drive.google.com/uc?export=download&id=1sS8a5AZdiXMze8f08iNnVL7kTnlRuarl"
     FALLBACK_DATABASE_URL = "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv"
     LOCAL_DB_FILE = "aircraftDatabase.csv"
-    DEFAULT_INTERVAL = 600          # 10 минут
+    DEFAULT_INTERVAL = 30           # 30 секунд (минимальный разумный интервал)
+    MIN_INTERVAL = 15               # минимально допустимый интервал (сек)
     DB_DOWNLOAD_TIMEOUT = 90
     DB_RETRY_ATTEMPTS = 3
     DB_RETRY_DELAY = 5
@@ -368,8 +369,6 @@ class AircraftTracker:
                         'call_sign': (data[16] or '').strip(),
                         'type': aircraft_type,
                         'operator': (data[18] or '').strip(),
-                        'altitude': data[4] if len(data) > 4 else None,
-                        'speed': data[5] if len(data) > 5 else None,
                         'lat': data[1] if len(data) > 1 else None,
                         'lon': data[2] if len(data) > 2 else None,
                         'timestamp': datetime.now()
@@ -433,8 +432,9 @@ class AircraftTracker:
             clean_type = normalize_type(aircraft_type)
             type_name = AIRCRAFT_NAMES.get(clean_type, aircraft_type)
 
+            # Формируем сообщение (убрали слово "Военный", убрали высоту и скорость)
             message = (
-                "🚨 Военный самолет обнаружен!\n"
+                "🚨 Самолет обнаружен!\n"
                 f"🕒 Время: {aircraft['timestamp'].strftime('%d.%m.%Y %H:%M:%S')}\n"
                 f"▫️ ICAO: {icao}\n"
                 f"▫️ Регистрация: {aircraft['registration'] or 'N/A'}\n"
@@ -442,9 +442,7 @@ class AircraftTracker:
                 f"▫️ Тип: {type_name}\n"
                 f"▫️ Оператор: {aircraft.get('operator', 'N/A') or 'N/A'}\n"
                 f"▫️ Страна: {aircraft['country']}\n"
-                f"▫️ Координаты: {aircraft['coordinates']}\n"
-                f"▫️ Высота: {aircraft.get('altitude') or 'N/A'} м\n"
-                f"▫️ Скорость: {round(aircraft['speed'] * 1.852) if aircraft.get('speed') else 'N/A'} км/ч"
+                f"▫️ Координаты: {aircraft['coordinates']}"
             )
 
             await context.bot.send_message(
@@ -476,7 +474,7 @@ def get_main_keyboard():
     )
 
 def get_interval_keyboard():
-    options = [60, 300, 600, 1800, 3600]
+    options = [60, 300, 600, 1800, 3600]  # 1, 5, 10, 30, 60 минут
     buttons = []
     for sec in options:
         label = f"{sec // 60} мин"
@@ -506,8 +504,8 @@ async def _start_monitoring_for_chat(chat_id: int, context: ContextTypes.DEFAULT
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text(
-        "🛩 Военный авиационный трекер\n"
-        "Отслеживание военных самолетов по данным Flightradar24.\n"
+        "🛩 Авиационный трекер (Flightradar24)\n"
+        "Отслеживание самолётов по типам из списка.\n"
         "Автоматически запускаю мониторинг...",
         reply_markup=get_main_keyboard()
     )
@@ -515,7 +513,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         started = await _start_monitoring_for_chat(chat_id, context)
         if started:
             interval = tracker.get_interval(chat_id)
-            await update.message.reply_text(f"✅ Мониторинг активен (интервал: {interval//60} мин.)")
+            await update.message.reply_text(f"✅ Мониторинг активен (интервал: {interval} сек.)")
         else:
             await update.message.reply_text("⚠️ Мониторинг уже запущен.")
     except RuntimeError as e:
@@ -523,8 +521,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 *Военный авиационный трекер*\n\n"
-        "Бот отслеживает военные самолёты по данным Flightradar24.\n"
+        "🤖 *Авиационный трекер*\n\n"
+        "Бот отслеживает самолёты по данным Flightradar24.\n"
         "Фильтрация по типу из списка целевых.\n"
         "При обнаружении приходит уведомление.\n\n"
         "*Команды:*\n"
@@ -532,7 +530,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help — справка\n"
         "/status — статус\n"
         "/stop — остановить\n"
-        "/setinterval <сек> — установить интервал (число секунд)",
+        "/setinterval <сек> — установить интервал (число секунд, минимум 15)",
         parse_mode="Markdown",
         reply_markup=get_main_keyboard()
     )
@@ -543,7 +541,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_active = chat_id in tracker.active_chats
     await update.message.reply_text(
         f"🔍 Отслежено бортов: {len(tracker.tracked_aircrafts)}\n"
-        f"⏱ Интервал: {interval//60} мин.\n"
+        f"⏱ Интервал: {interval} сек.\n"
         f"🟢 Мониторинг: {'активен' if is_active else 'остановлен'}\n"
         f"⏳ Последнее обновление: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
         reply_markup=get_main_keyboard()
@@ -555,7 +553,7 @@ async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
         started = await _start_monitoring_for_chat(chat_id, context)
         if started:
             interval = tracker.get_interval(chat_id)
-            await update.message.reply_text(f"✅ Мониторинг запущен (интервал {interval//60} мин.).", reply_markup=get_main_keyboard())
+            await update.message.reply_text(f"✅ Мониторинг запущен (интервал {interval} сек.).", reply_markup=get_main_keyboard())
         else:
             await update.message.reply_text("⚠️ Мониторинг уже активен.", reply_markup=get_main_keyboard())
     except RuntimeError as e:
@@ -582,7 +580,7 @@ async def interval_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current = tracker.get_interval(chat_id)
     await update.message.reply_text(
         f"⚙️ *Настройка интервала опроса*\n\n"
-        f"Текущий интервал: *{current//60} мин.*\n\n"
+        f"Текущий интервал: *{current} сек.*\n\n"
         "Выберите новый интервал:",
         parse_mode="Markdown",
         reply_markup=get_interval_keyboard()
@@ -610,14 +608,14 @@ async def handle_interval_choice(update: Update, context: ContextTypes.DEFAULT_T
             try:
                 await _start_monitoring_for_chat(chat_id, context, new_interval)
                 await update.message.reply_text(
-                    f"✅ Интервал изменён на {new_interval//60} мин. Мониторинг перезапущен.",
+                    f"✅ Интервал изменён на {new_interval} сек. Мониторинг перезапущен.",
                     reply_markup=get_main_keyboard()
                 )
             except Exception as e:
                 await update.message.reply_text(f"❌ Ошибка при перезапуске: {e}", reply_markup=get_main_keyboard())
         else:
             await update.message.reply_text(
-                f"✅ Интервал сохранён ({new_interval//60} мин.). Запустите мониторинг для применения.",
+                f"✅ Интервал сохранён ({new_interval} сек.). Запустите мониторинг для применения.",
                 reply_markup=get_main_keyboard()
             )
     else:
@@ -626,12 +624,12 @@ async def handle_interval_choice(update: Update, context: ContextTypes.DEFAULT_T
 async def set_interval_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not context.args:
-        await update.message.reply_text("Укажите интервал в секундах, например: /setinterval 300")
+        await update.message.reply_text("Укажите интервал в секундах, например: /setinterval 30")
         return
     try:
         seconds = int(context.args[0])
-        if seconds < 30:
-            await update.message.reply_text("Минимальный интервал – 30 секунд.")
+        if seconds < Config.MIN_INTERVAL:
+            await update.message.reply_text(f"Минимальный интервал – {Config.MIN_INTERVAL} секунд.")
             return
         tracker.set_interval(chat_id, seconds)
         if chat_id in tracker.active_chats:

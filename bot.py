@@ -2,8 +2,11 @@ import logging
 import csv
 import os
 import asyncio
+import socket
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
+import aiohttp
+import requests
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
@@ -13,7 +16,7 @@ from telegram.ext import (
     filters,
 )
 
-# Правильный импорт библиотеки Flightradar24
+# Импорт Flightradar24
 from FlightRadarAPI import FlightRadar24API
 
 # -------------------- КОНФИГУРАЦИЯ --------------------
@@ -22,15 +25,18 @@ class Config:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не задан!")
 
+    # OpenSky как fallback
+    OPENSKY_URL = "https://opensky-network.org/api/states/all"
     DATABASE_URL = "https://drive.google.com/uc?export=download&id=1sS8a5AZdiXMze8f08iNnVL7kTnlRuarl"
     FALLBACK_DATABASE_URL = "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv"
     LOCAL_DB_FILE = "aircraftDatabase.csv"
     DEFAULT_INTERVAL = 600
+    REQUEST_TIMEOUT = 60
     DB_DOWNLOAD_TIMEOUT = 90
     DB_RETRY_ATTEMPTS = 3
     DB_RETRY_DELAY = 5
 
-# -------------------- ДАННЫЕ (без изменений) --------------------
+# -------------------- ДАННЫЕ --------------------
 AIRCRAFT_NAMES = {
     'B52': 'B-52 Stratofortress',
     'C17': 'C-17 Globemaster III',
@@ -164,7 +170,6 @@ class AircraftDatabase:
         logger.info(f"База загружена: {len(self.data)} записей")
 
     def _download_sync(self):
-        import requests
         for attempt in range(1, Config.DB_RETRY_ATTEMPTS + 1):
             try:
                 logger.info(f"Попытка {attempt} из {Config.DB_RETRY_ATTEMPTS} – скачивание с Google Drive")
@@ -234,7 +239,7 @@ class AircraftDatabase:
     def get(self, icao: str) -> Optional[Dict[str, str]]:
         return self.data.get(icao.lower())
 
-# -------------------- ОСНОВНОЙ КЛАСС ТРЕКЕРА (Flightradar24) --------------------
+# -------------------- ОСНОВНОЙ КЛАСС ТРЕКЕРА (Flightradar24 + fallback) --------------------
 class AircraftTracker:
     def __init__(self, db: AircraftDatabase):
         self.db = db
@@ -253,95 +258,185 @@ class AircraftTracker:
         chat_id = context.job.chat_id
         start_time = datetime.now()
 
+        # Сначала пробуем Flightradar24
         try:
             logger.info("📡 Запрос к Flightradar24...")
-            # Получаем список всех активных рейсов
             flights = await asyncio.to_thread(self.fr_api.get_flights)
-            
-            if not flights:
-                logger.info("ℹ️ Flightradar24 не вернул рейсов")
+            if flights:
+                logger.info(f"✈️ Получено {len(flights)} рейсов от Flightradar24")
+                await self.process_flights(flights, chat_id, context, "FR24")
                 return
-
-            logger.info(f"✈️ Получено {len(flights)} рейсов от Flightradar24")
-            target_count = 0
-
-            for flight in flights:
-                # Извлекаем ICAO (в библиотеке это поле 'id')
-                icao = getattr(flight, 'id', '').upper()
-                if not icao:
-                    continue
-
-                # Пропускаем уже отслеженные
-                if icao in self.tracked_aircrafts:
-                    continue
-
-                # Получаем тип ВС из базы по ICAO
-                db_entry = self.db.get(icao)
-                if db_entry:
-                    aircraft_type = db_entry['type']
-                    registration = db_entry['registration']
-                else:
-                    aircraft_type = "N/A"
-                    registration = "N/A"
-
-                # Если тип не определён, пытаемся получить его напрямую из flight
-                if aircraft_type == "N/A":
-                    # В объекте Flight может быть поле 'type' или 'aircraft_type'
-                    aircraft_type = getattr(flight, 'type', 'N/A') or 'N/A'
-
-                # Фильтрация по типу
-                if not is_target_aircraft(aircraft_type):
-                    continue
-
-                target_count += 1
-                logger.info(f"🎯 Найден военный: {icao} ({aircraft_type})")
-
-                # Собираем данные для отправки
-                callsign = getattr(flight, 'callsign', 'N/A') or 'N/A'
-                country = getattr(flight, 'origin_country', 'Неизвестно') or 'Неизвестно'
-                lat = getattr(flight, 'latitude', None)
-                lon = getattr(flight, 'longitude', None)
-
-                aircraft = {
-                    'icao': icao,
-                    'call_sign': callsign,
-                    'country': country,
-                    'lat': lat,
-                    'lon': lon,
-                    'timestamp': datetime.now(),
-                    'registration': registration,
-                    'type': aircraft_type,
-                    'coordinates': format_coordinates(lat, lon)
-                }
-
-                self.tracked_aircrafts[icao] = aircraft
-
-                clean_type = normalize_type(aircraft_type)
-                type_name = AIRCRAFT_NAMES.get(clean_type, aircraft_type if aircraft_type != "N/A" else "Неизвестен")
-
-                message = (
-                    "🚨 Военный самолет обнаружен!\n"
-                    f"🕒 Время: {aircraft['timestamp'].strftime('%d.%m.%Y %H:%M:%S')}\n"
-                    f"▫️ ICAO: {icao}\n"
-                    f"▫️ Позывной: {callsign}\n"
-                    f"▫️ Регистрация: {registration}\n"
-                    f"▫️ Тип: {type_name}\n"
-                    f"▫️ Страна: {country}\n"
-                    f"▫️ Координаты: {aircraft['coordinates']}"
-                )
-
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=message,
-                    disable_web_page_preview=True
-                )
-                logger.info(f"✅ Обнаружение отправлено: {icao} ({type_name})")
-
-            if target_count == 0:
-                logger.info("ℹ️ Военных целей не найдено в текущем наборе")
-
+            else:
+                logger.warning("⚠️ Flightradar24 не вернул рейсов, пробуем OpenSky...")
         except Exception as e:
-            logger.error(f"❌ Ошибка при запросе к Flightradar24: {e}", exc_info=True)
+            logger.error(f"❌ Ошибка Flightradar24: {e}, пробуем OpenSky...")
+
+        # Fallback: OpenSky Network
+        await self.fetch_opensky(chat_id, context)
+
+    async def process_flights(self, flights, chat_id, context, source):
+        """Обрабатывает список рейсов (Flight objects) и отправляет уведомления"""
+        target_count = 0
+        for flight in flights:
+            icao = getattr(flight, 'id', '').upper()
+            if not icao:
+                continue
+            if icao in self.tracked_aircrafts:
+                continue
+
+            db_entry = self.db.get(icao)
+            if db_entry:
+                aircraft_type = db_entry['type']
+                registration = db_entry['registration']
+            else:
+                aircraft_type = getattr(flight, 'type', 'N/A') or 'N/A'
+                registration = 'N/A'
+
+            if not is_target_aircraft(aircraft_type):
+                continue
+
+            target_count += 1
+            logger.info(f"🎯 Найден военный: {icao} ({aircraft_type})")
+
+            callsign = getattr(flight, 'callsign', 'N/A') or 'N/A'
+            country = getattr(flight, 'origin_country', 'Неизвестно') or 'Неизвестно'
+            lat = getattr(flight, 'latitude', None)
+            lon = getattr(flight, 'longitude', None)
+
+            aircraft = {
+                'icao': icao,
+                'call_sign': callsign,
+                'country': country,
+                'lat': lat,
+                'lon': lon,
+                'timestamp': datetime.now(),
+                'registration': registration,
+                'type': aircraft_type,
+                'coordinates': format_coordinates(lat, lon)
+            }
+            self.tracked_aircrafts[icao] = aircraft
+
+            clean_type = normalize_type(aircraft_type)
+            type_name = AIRCRAFT_NAMES.get(clean_type, aircraft_type if aircraft_type != "N/A" else "Неизвестен")
+
+            message = (
+                f"🚨 Военный самолет обнаружен! ({source})\n"
+                f"🕒 Время: {aircraft['timestamp'].strftime('%d.%m.%Y %H:%M:%S')}\n"
+                f"▫️ ICAO: {icao}\n"
+                f"▫️ Позывной: {callsign}\n"
+                f"▫️ Регистрация: {registration}\n"
+                f"▫️ Тип: {type_name}\n"
+                f"▫️ Страна: {country}\n"
+                f"▫️ Координаты: {aircraft['coordinates']}"
+            )
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                disable_web_page_preview=True
+            )
+            logger.info(f"✅ Обнаружение отправлено: {icao} ({type_name})")
+
+        if target_count == 0:
+            logger.info("ℹ️ Военных целей не найдено в текущем наборе")
+
+    async def fetch_opensky(self, chat_id, context):
+        """Получение данных из OpenSky Network с повторными попытками"""
+        start_time = datetime.now()
+        for attempt in range(1, 4):
+            try:
+                connector = aiohttp.TCPConnector(family=socket.AF_INET)
+                timeout = aiohttp.ClientTimeout(total=60, connect=20, sock_connect=20, sock_read=40)
+                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                    logger.info(f"📡 Запрос к OpenSky (попытка {attempt})")
+                    async with session.get(Config.OPENSKY_URL, headers={'User-Agent': 'Mozilla/5.0'}) as response:
+                        elapsed = (datetime.now() - start_time).total_seconds()
+                        logger.info(f"📊 Статус OpenSky: {response.status} (время {elapsed:.1f}с)")
+                        if response.status != 200:
+                            logger.warning(f"OpenSky вернул {response.status}, повтор через 5с")
+                            await asyncio.sleep(5)
+                            continue
+                        data = await response.json(content_type=None)
+                        if 'states' not in data or not data['states']:
+                            logger.info("ℹ️ OpenSky не вернул данных")
+                            return
+                        states = data['states']
+                        logger.info(f"✈️ Получено {len(states)} бортов от OpenSky")
+                        # Преобразуем в формат, похожий на Flight
+                        for state in states:
+                            aircraft = self.parse_opensky_state(state)
+                            if aircraft:
+                                # Имитируем объект Flight для единой обработки
+                                # Но проще сразу обработать здесь
+                                await self.process_opensky_aircraft(aircraft, chat_id, context)
+                        return
+            except asyncio.TimeoutError:
+                logger.warning(f"⏳ Таймаут OpenSky (попытка {attempt})")
+                if attempt == 3:
+                    logger.error("❌ Все попытки OpenSky исчерпаны")
+                else:
+                    await asyncio.sleep(10)
+            except Exception as e:
+                logger.error(f"❌ Ошибка OpenSky: {e} (попытка {attempt})")
+                if attempt == 3:
+                    break
+                await asyncio.sleep(5)
+
+    def parse_opensky_state(self, state: List) -> Optional[Dict]:
+        if not isinstance(state, list) or len(state) < 7:
+            return None
+        icao = state[0] or 'N/A'
+        if icao == 'N/A' or state[8] is True:  # on_ground
+            return None
+        callsign = (state[1] or '').strip() or 'N/A'
+        country = (state[2] or '').strip() or 'Неизвестно'
+        lon = state[5] if len(state) > 5 else None
+        lat = state[6] if len(state) > 6 else None
+        return {
+            'icao': icao.upper(),
+            'call_sign': callsign,
+            'country': country,
+            'lat': lat,
+            'lon': lon,
+            'timestamp': datetime.now()
+        }
+
+    async def process_opensky_aircraft(self, aircraft, chat_id, context):
+        icao = aircraft['icao']
+        if icao in self.tracked_aircrafts:
+            return
+        db_entry = self.db.get(icao)
+        if db_entry:
+            aircraft_type = db_entry['type']
+            registration = db_entry['registration']
+        else:
+            aircraft_type = "N/A"
+            registration = "N/A"
+        if not is_target_aircraft(aircraft_type):
+            return
+
+        logger.info(f"🎯 Найден военный (OpenSky): {icao} ({aircraft_type})")
+
+        aircraft['registration'] = registration
+        aircraft['type'] = aircraft_type
+        aircraft['coordinates'] = format_coordinates(aircraft['lat'], aircraft['lon'])
+        self.tracked_aircrafts[icao] = aircraft
+
+        clean_type = normalize_type(aircraft_type)
+        type_name = AIRCRAFT_NAMES.get(clean_type, aircraft_type if aircraft_type != "N/A" else "Неизвестен")
+
+        message = (
+            "🚨 Военный самолет обнаружен! (OpenSky)\n"
+            f"🕒 Время: {aircraft['timestamp'].strftime('%d.%m.%Y %H:%M:%S')}\n"
+            f"▫️ ICAO: {icao}\n"
+            f"▫️ Позывной: {aircraft['call_sign']}\n"
+            f"▫️ Регистрация: {registration}\n"
+            f"▫️ Тип: {type_name}\n"
+            f"▫️ Страна: {aircraft['country']}\n"
+            f"▫️ Координаты: {aircraft['coordinates']}"
+        )
+        await context.bot.send_message(chat_id=chat_id, text=message, disable_web_page_preview=True)
+        logger.info(f"✅ Обнаружение отправлено (OpenSky): {icao} ({type_name})")
 
 # -------------------- ОБРАБОТЧИКИ КОМАНД (без изменений) --------------------
 tracker = None
@@ -388,8 +483,8 @@ async def _start_monitoring_for_chat(chat_id: int, context: ContextTypes.DEFAULT
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text(
-        "🛩 Военный авиационный трекер (Flightradar24)\n"
-        "Отслеживание военных самолётов.\n"
+        "🛩 Военный авиационный трекер (Flightradar24 + OpenSky)\n"
+        "Отслеживание военных самолётов из двух источников.\n"
         "Автоматически запускаю мониторинг...",
         reply_markup=get_main_keyboard()
     )
@@ -406,7 +501,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Военный авиационный трекер*\n\n"
-        "Бот отслеживает военные самолёты по данным Flightradar24.\n"
+        "Бот отслеживает военные самолёты по данным Flightradar24 и OpenSky.\n"
         "Фильтрация по типу из списка целевых.\n"
         "При обнаружении приходит уведомление.\n\n"
         "*Команды:*\n"

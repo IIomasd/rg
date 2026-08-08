@@ -22,16 +22,35 @@ class Config:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не задан!")
 
-    # Используем альтернативный публичный эндпоинт ADS-B Exchange
-    ADSB_API_URL = "https://data.adsbexchange.com/aircraft.json"
-    # Запасной вариант, если первый не работает:
-    # ADSB_API_URL = "https://api.adsbexchange.com/aircraft.json"
+    # Список источников данных (проверяем по очереди)
+    DATA_SOURCES = [
+        {
+            "url": "https://data.adsbexchange.com/aircraft.json",
+            "type": "adsb",
+            "headers": {"Accept": "application/json"}
+        },
+        {
+            "url": "https://api.adsb.lol/aircraft.json",
+            "type": "adsb",
+            "headers": {"Accept": "application/json"}
+        },
+        {
+            "url": "https://public-api.adsbexchange.com/VirtualRadar/AircraftList.json",
+            "type": "adsb",
+            "headers": {"Accept": "application/json"}
+        },
+        {
+            "url": "https://opensky-network.org/api/states/all",
+            "type": "opensky",
+            "headers": {"User-Agent": "Mozilla/5.0"}
+        }
+    ]
 
     DATABASE_URL = "https://drive.google.com/uc?export=download&id=1sS8a5AZdiXMze8f08iNnVL7kTnlRuarl"
     FALLBACK_DATABASE_URL = "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv"
     LOCAL_DB_FILE = "aircraftDatabase.csv"
     DEFAULT_INTERVAL = 600
-    REQUEST_TIMEOUT = 90
+    REQUEST_TIMEOUT = 60  # уменьшен для быстрого переключения
     DB_DOWNLOAD_TIMEOUT = 90
     DB_RETRY_ATTEMPTS = 3
     DB_RETRY_DELAY = 5
@@ -241,7 +260,7 @@ class AircraftDatabase:
     def get(self, icao: str) -> Optional[Dict[str, str]]:
         return self.data.get(icao.lower())
 
-# -------------------- ОСНОВНОЙ КЛАСС ТРЕКЕРА (с исправлением JSON) --------------------
+# -------------------- ОСНОВНОЙ КЛАСС ТРЕКЕРА (с переключением источников) --------------------
 class AircraftTracker:
     def __init__(self, db: AircraftDatabase):
         self.db = db
@@ -259,135 +278,149 @@ class AircraftTracker:
         chat_id = context.job.chat_id
         start_time = datetime.now()
 
-        for attempt in range(1, 4):
+        # Пытаемся получить данные от каждого источника по очереди
+        for source in Config.DATA_SOURCES:
+            logger.info(f"🔄 Пробую источник: {source['url']}")
             try:
                 connector = aiohttp.TCPConnector(family=socket.AF_INET)
                 timeout = aiohttp.ClientTimeout(
                     total=Config.REQUEST_TIMEOUT,
-                    connect=30,
-                    sock_connect=30,
-                    sock_read=60
+                    connect=20,
+                    sock_connect=20,
+                    sock_read=40
                 )
                 async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                    logger.info(f"📡 Запрос к ADS-B Exchange (попытка {attempt})")
-
-                    # Добавляем заголовок Accept, чтобы сервер отдал JSON
-                    headers = {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                        'Accept': 'application/json'
-                    }
-
-                    async with session.get(Config.ADSB_API_URL, headers=headers) as response:
+                    headers = source.get("headers", {})
+                    async with session.get(source["url"], headers=headers) as response:
                         elapsed = (datetime.now() - start_time).total_seconds()
-                        logger.info(f"📊 Статус ответа: {response.status} (время {elapsed:.1f}с)")
+                        logger.info(f"📊 Статус ответа от {source['url']}: {response.status} (время {elapsed:.1f}с)")
                         if response.status != 200:
-                            logger.warning(f"⚠️ Сервер вернул {response.status}, повтор через 5с")
-                            await asyncio.sleep(5)
+                            logger.warning(f"⚠️ Сервер {source['url']} вернул {response.status}, пробуем следующий")
                             continue
 
-                        # Принудительно парсим JSON, игнорируя Content-Type
+                        # Парсим JSON (для всех источников)
                         try:
                             data = await response.json(content_type=None)
                         except Exception as e:
-                            logger.error(f"Ошибка парсинга JSON: {e}")
-                            # Если не удалось, возможно, ответ не JSON – пробуем прочитать текст для диагностики
-                            text = await response.text()
-                            logger.error(f"Получен текст: {text[:200]}...")
-                            raise
+                            logger.error(f"Ошибка парсинга JSON от {source['url']}: {e}")
+                            continue
 
-                        logger.info(f"✅ JSON получен за {(datetime.now() - start_time).total_seconds():.1f}с")
-
-                        aircraft_list = data.get('ac', [])
-                        if not aircraft_list:
-                            logger.info("ℹ️ Список самолётов пуст")
-                            return
-
-                        logger.info(f"✈️ Получено самолётов: {len(aircraft_list)}")
-
-                        for ac in aircraft_list:
-                            aircraft = self.parse_aircraft_adsb(ac)
-                            if not aircraft:
+                        # Обрабатываем данные в зависимости от типа источника
+                        if source["type"] == "adsb":
+                            aircraft_list = data.get('ac', [])
+                            if not aircraft_list:
+                                logger.info(f"ℹ️ Источник {source['url']} не вернул самолётов")
                                 continue
-
-                            icao = aircraft['icao']
-                            if icao in self.tracked_aircrafts:
+                            logger.info(f"✈️ Получено {len(aircraft_list)} бортов от {source['url']}")
+                            for ac in aircraft_list:
+                                aircraft = self.parse_aircraft_adsb(ac)
+                                if not aircraft:
+                                    continue
+                                await self.process_aircraft(aircraft, chat_id, context)
+                            return  # успешно завершили
+                        elif source["type"] == "opensky":
+                            if 'states' not in data or not data['states']:
+                                logger.info(f"ℹ️ OpenSky не вернул самолётов")
                                 continue
-
-                            db_entry = self.db.get(icao)
-                            if db_entry:
-                                aircraft_type = db_entry['type']
-                                registration = db_entry['registration']
-                            else:
-                                aircraft_type = "N/A"
-                                registration = "N/A"
-
-                            if not is_target_aircraft(aircraft_type):
-                                continue
-
-                            aircraft['registration'] = registration
-                            aircraft['type'] = aircraft_type
-                            self.tracked_aircrafts[icao] = aircraft
-                            aircraft['coordinates'] = format_coordinates(aircraft['lat'], aircraft['lon'])
-
-                            clean_type = normalize_type(aircraft_type)
-                            type_name = AIRCRAFT_NAMES.get(clean_type, aircraft_type if aircraft_type != "N/A" else "Неизвестен")
-
-                            message = (
-                                "🚨 Военный самолет обнаружен!\n"
-                                f"🕒 Время: {aircraft['timestamp'].strftime('%d.%m.%Y %H:%M:%S')}\n"
-                                f"▫️ ICAO: {icao}\n"
-                                f"▫️ Позывной: {aircraft['call_sign']}\n"
-                                f"▫️ Регистрация: {registration}\n"
-                                f"▫️ Тип: {type_name}\n"
-                                f"▫️ Страна: {aircraft['country']}\n"
-                                f"▫️ Координаты: {aircraft['coordinates']}"
-                            )
-
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=message,
-                                disable_web_page_preview=True
-                            )
-                            logger.info(f"✅ Обнаружение: {icao} ({type_name})")
-
-                        return  # успешно завершаем
+                            states = data['states']
+                            logger.info(f"✈️ Получено {len(states)} бортов от OpenSky")
+                            for state in states:
+                                aircraft = self.parse_aircraft_opensky(state)
+                                if not aircraft:
+                                    continue
+                                await self.process_aircraft(aircraft, chat_id, context)
+                            return  # успешно завершили
 
             except asyncio.TimeoutError:
                 elapsed = (datetime.now() - start_time).total_seconds()
-                logger.warning(f"⏳ Таймаут через {elapsed:.1f}с (попытка {attempt})")
-                if attempt == 3:
-                    logger.error("❌ Все попытки исчерпаны, пропускаем цикл")
-                    return
-                await asyncio.sleep(10)
-            except aiohttp.ClientResponseError as e:
-                logger.error(f"🌐 Ошибка HTTP: {e.status} – {e.message} (попытка {attempt})")
-                if attempt == 3:
-                    return
-                await asyncio.sleep(5)
+                logger.warning(f"⏳ Таймаут от {source['url']} через {elapsed:.1f}с")
+                continue
             except aiohttp.ClientError as e:
-                logger.error(f"🌐 Ошибка клиента: {e} (попытка {attempt})")
-                if attempt == 3:
-                    return
-                await asyncio.sleep(5)
+                logger.error(f"🌐 Клиентская ошибка от {source['url']}: {e}")
+                continue
             except Exception as e:
-                logger.error(f"❌ Непредвиденная ошибка: {e}", exc_info=True)
-                return
+                logger.error(f"❌ Непредвиденная ошибка от {source['url']}: {e}", exc_info=True)
+                continue
+
+        # Если ни один источник не сработал
+        logger.error("❌ Все источники данных недоступны, пропускаем цикл")
+
+    async def process_aircraft(self, aircraft: Dict, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+        icao = aircraft['icao']
+        if icao in self.tracked_aircrafts:
+            return
+
+        db_entry = self.db.get(icao)
+        if db_entry:
+            aircraft_type = db_entry['type']
+            registration = db_entry['registration']
+        else:
+            aircraft_type = "N/A"
+            registration = "N/A"
+
+        if not is_target_aircraft(aircraft_type):
+            return
+
+        aircraft['registration'] = registration
+        aircraft['type'] = aircraft_type
+        self.tracked_aircrafts[icao] = aircraft
+        aircraft['coordinates'] = format_coordinates(aircraft['lat'], aircraft['lon'])
+
+        clean_type = normalize_type(aircraft_type)
+        type_name = AIRCRAFT_NAMES.get(clean_type, aircraft_type if aircraft_type != "N/A" else "Неизвестен")
+
+        message = (
+            "🚨 Военный самолет обнаружен!\n"
+            f"🕒 Время: {aircraft['timestamp'].strftime('%d.%m.%Y %H:%M:%S')}\n"
+            f"▫️ ICAO: {icao}\n"
+            f"▫️ Позывной: {aircraft['call_sign']}\n"
+            f"▫️ Регистрация: {registration}\n"
+            f"▫️ Тип: {type_name}\n"
+            f"▫️ Страна: {aircraft['country']}\n"
+            f"▫️ Координаты: {aircraft['coordinates']}"
+        )
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=message,
+            disable_web_page_preview=True
+        )
+        logger.info(f"✅ Обнаружение: {icao} ({type_name})")
 
     def parse_aircraft_adsb(self, ac: Dict) -> Optional[Dict]:
-        """Парсинг одного объекта от ADS-B Exchange"""
         icao = ac.get('hex', '').upper()
         if not icao:
             return None
-
-        # Фильтруем наземные (если есть поле 'gnd' и оно True)
         if ac.get('gnd', False):
             return None
-
         callsign = ac.get('flight', '').strip() or 'N/A'
         country = ac.get('country', 'Неизвестно')
         lat = ac.get('lat')
         lon = ac.get('lon')
+        return {
+            'icao': icao,
+            'call_sign': callsign,
+            'country': country,
+            'lat': lat,
+            'lon': lon,
+            'timestamp': datetime.now(),
+            'registration': 'N/A',
+            'type': 'N/A'
+        }
 
+    def parse_aircraft_opensky(self, state: List) -> Optional[Dict]:
+        if not isinstance(state, list) or len(state) < 7:
+            return None
+        icao = state[0] or 'N/A'
+        if icao == 'N/A':
+            return None
+        on_ground = state[8] if len(state) > 8 else None
+        if on_ground:
+            return None
+        callsign = (state[1] or '').strip() or 'N/A'
+        country = (state[2] or '').strip() or 'Неизвестно'
+        lon = state[5] if len(state) > 5 else None
+        lat = state[6] if len(state) > 6 else None
         return {
             'icao': icao,
             'call_sign': callsign,
@@ -444,8 +477,8 @@ async def _start_monitoring_for_chat(chat_id: int, context: ContextTypes.DEFAULT
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text(
-        "🛩 Военный авиационный трекер (ADS-B Exchange)\n"
-        "Отслеживание военных самолётов.\n"
+        "🛩 Военный авиационный трекер (многоканальный)\n"
+        "Отслеживание военных самолётов из разных источников.\n"
         "Автоматически запускаю мониторинг...",
         reply_markup=get_main_keyboard()
     )
@@ -462,7 +495,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Военный авиационный трекер*\n\n"
-        "Бот отслеживает военные самолёты по данным ADS-B Exchange.\n"
+        "Бот отслеживает военные самолёты по данным ADS-B Exchange и OpenSky.\n"
         "Фильтрация по типу из списка целевых.\n"
         "При обнаружении приходит уведомление.\n\n"
         "*Команды:*\n"

@@ -30,10 +30,21 @@ class Config:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не задан!")
 
+    # Прокси (из переменных окружения)
+    HTTP_PROXY = os.getenv("HTTP_PROXY")
+    HTTPS_PROXY = os.getenv("HTTPS_PROXY")
+
     # OpenSky (анонимный доступ)
     OPENSKY_URL = "https://opensky-network.org/api/states/all"
-    # ADS-B Exchange (альтернативный эндпоинт)
-    ADSB_URL = "https://opendata.adsb.fi/api/v3/aircraft"
+
+    # ADS-B Exchange (несколько эндпоинтов)
+    ADSB_ENDPOINTS = [
+        "https://opendata.adsb.fi/api/v3/aircraft",
+        "https://api.adsb.fi/api/v3/aircraft",
+        "https://airplanes.live/v1/aircraft",
+        "https://public-api.adsbexchange.com/api/aircraft/HEX.json",  # требует ICAO, но используем как fallback
+    ]
+
     # База данных ICAO
     DATABASE_URL = "https://drive.google.com/uc?export=download&id=1sS8a5AZdiXMze8f08iNnVL7kTnlRuarl"
     FALLBACK_DATABASE_URL = "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv"
@@ -300,7 +311,7 @@ class AircraftDatabase:
     def get(self, icao: str) -> Optional[Dict[str, str]]:
         return self.data.get(icao.lower())
 
-# ---------- Основной трекер ----------
+# ---------- Основной трекер с поддержкой прокси ----------
 class AircraftTracker:
     def __init__(self, db: AircraftDatabase):
         self.db = db
@@ -309,21 +320,28 @@ class AircraftTracker:
         self.chat_intervals: Dict[int, int] = {}
         self.fr24_api = FlightRadar24API() if FR24_API_AVAILABLE else None
 
+        # Настройка прокси для aiohttp
+        self.proxy = Config.HTTPS_PROXY or Config.HTTP_PROXY
+
     def get_interval(self, chat_id: int) -> int:
         return self.chat_intervals.get(chat_id, Config.DEFAULT_INTERVAL)
 
     def set_interval(self, chat_id: int, interval_seconds: int):
         self.chat_intervals[chat_id] = interval_seconds
 
-    # ---------- OpenSky (анонимный, с повторными попытками) ----------
+    # ---------- OpenSky (анонимный, с прокси и повторными попытками) ----------
     async def fetch_opensky(self) -> List[Dict]:
-        for attempt in range(1, 4):
+        for attempt in range(1, 5):  # 4 попытки
             try:
                 connector = aiohttp.TCPConnector(family=socket.AF_INET)
-                timeout = aiohttp.ClientTimeout(total=60, connect=20)
-                logger.info(f"🔄 OpenSky: попытка {attempt}...")
+                timeout = aiohttp.ClientTimeout(total=90, connect=30)
+                logger.info(f"🔄 OpenSky: попытка {attempt} (прокси: {self.proxy if self.proxy else 'нет'})...")
                 async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                    async with session.get(Config.OPENSKY_URL, headers={'User-Agent': 'Mozilla/5.0'}) as resp:
+                    async with session.get(
+                        Config.OPENSKY_URL,
+                        headers={'User-Agent': 'Mozilla/5.0'},
+                        proxy=self.proxy if self.proxy else None
+                    ) as resp:
                         if resp.status != 200:
                             logger.warning(f"OpenSky статус {resp.status}")
                             continue
@@ -367,62 +385,71 @@ class AircraftTracker:
         logger.error("OpenSky: все попытки неудачны")
         return []
 
-    # ---------- ADS-B Exchange (через opendata.adsb.fi) ----------
+    # ---------- ADS-B (несколько эндпоинтов) ----------
     async def fetch_adsb(self) -> List[Dict]:
-        try:
-            url = Config.ADSB_URL
-            params = {
-                "bounds": "90,-90,-180,180",
-                "format": "json"
-            }
-            headers = {
-                "User-Agent": "MilitaryAircraftBot/1.0",
-                "Accept": "application/json"
-            }
-            logger.info("🔄 ADS-B (opendata.adsb.fi): запрос...")
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params, headers=headers, timeout=20) as resp:
-                    if resp.status != 200:
-                        logger.warning(f"ADS-B статус {resp.status}")
-                        return []
-                    try:
-                        data = await resp.json(content_type=None)
-                    except Exception as e:
-                        text = await resp.text()
-                        logger.error(f"ADS-B JSON ошибка: {e}, получено: {text[:200]}")
-                        return []
-                    ac_list = data.get('ac', [])
-                    if not ac_list:
-                        return []
-                    result = []
-                    for ac in ac_list:
-                        if ac.get('gnd'):
+        headers = {
+            "User-Agent": "MilitaryAircraftBot/1.0",
+            "Accept": "application/json"
+        }
+        for url in Config.ADSB_ENDPOINTS:
+            try:
+                logger.info(f"🔄 ADS-B: запрос к {url}")
+                params = {}
+                if "adsb.fi" in url or "airplanes.live" in url:
+                    params = {"bounds": "90,-90,-180,180", "format": "json"}
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, params=params, headers=headers, timeout=20) as resp:
+                        if resp.status != 200:
+                            logger.warning(f"ADS-B статус {resp.status} для {url}")
                             continue
-                        icao = ac.get('hex', '').upper()
-                        if not icao:
+                        try:
+                            data = await resp.json(content_type=None)
+                        except Exception as e:
+                            text = await resp.text()
+                            logger.error(f"ADS-B JSON ошибка: {e}, получено: {text[:200]}")
                             continue
-                        lat, lon = ac.get('lat'), ac.get('lon')
-                        if not is_in_region(lat, lon):
+                        # Обработка разных форматов
+                        ac_list = []
+                        if 'ac' in data:
+                            ac_list = data['ac']
+                        elif 'aircraft' in data:
+                            ac_list = data['aircraft']
+                        else:
+                            logger.warning(f"Неизвестный формат от {url}")
                             continue
-                        result.append({
-                            'icao': icao,
-                            'registration': ac.get('r', '').strip() or 'N/A',
-                            'call_sign': ac.get('flight', '').strip() or 'N/A',
-                            'type': ac.get('t', 'N/A'),
-                            'operator': ac.get('ownOp', '').strip() or 'N/A',
-                            'lat': lat,
-                            'lon': lon,
-                            'altitude': ac.get('alt'),
-                            'speed': ac.get('speed'),
-                            'timestamp': datetime.now(),
-                            'country': get_country_by_registration(ac.get('r', '')),
-                            'coordinates': format_coordinates(lat, lon)
-                        })
-                    logger.info(f"ADS-B: {len(result)} бортов в регионе")
-                    return result
-        except Exception as e:
-            logger.error(f"ADS-B ошибка: {e}")
-            return []
+                        if not ac_list:
+                            continue
+                        result = []
+                        for ac in ac_list:
+                            if ac.get('gnd'):
+                                continue
+                            icao = ac.get('hex', '').upper()
+                            if not icao:
+                                continue
+                            lat, lon = ac.get('lat'), ac.get('lon')
+                            if not is_in_region(lat, lon):
+                                continue
+                            result.append({
+                                'icao': icao,
+                                'registration': ac.get('r', '').strip() or 'N/A',
+                                'call_sign': ac.get('flight', '').strip() or 'N/A',
+                                'type': ac.get('t', 'N/A'),
+                                'operator': ac.get('ownOp', '').strip() or 'N/A',
+                                'lat': lat,
+                                'lon': lon,
+                                'altitude': ac.get('alt'),
+                                'speed': ac.get('speed'),
+                                'timestamp': datetime.now(),
+                                'country': get_country_by_registration(ac.get('r', '')),
+                                'coordinates': format_coordinates(lat, lon)
+                            })
+                        if result:
+                            logger.info(f"ADS-B: {len(result)} бортов в регионе от {url}")
+                            return result
+            except Exception as e:
+                logger.error(f"ADS-B ошибка для {url}: {e}")
+                continue
+        return []
 
     # ---------- FlightRadarAPI (запасной) ----------
     async def fetch_fr24_api(self) -> List[Dict]:
@@ -561,7 +588,7 @@ async def _start_monitoring(chat_id: int, context: ContextTypes.DEFAULT_TYPE, in
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text(
-        "🛩 Мульти-трекер (OpenSky, ADS-B, FR24)\n"
+        "🛩 Мульти-трекер (OpenSky с прокси, ADS-B, FR24)\n"
         "Отслеживание в заданных регионах.\n"
         "Автоматически запускаю мониторинг...",
         reply_markup=get_main_keyboard()
@@ -580,13 +607,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Мульти-трекер*\n\n"
         "Использует источники:\n"
-        "- OpenSky (HTTP, анонимный доступ, 3 попытки)\n"
-        "- ADS-B Exchange (opendata.adsb.fi)\n"
+        "- OpenSky (HTTP, анонимный, с поддержкой прокси)\n"
+        "- ADS-B Exchange (несколько эндпоинтов)\n"
         "- FlightRadarAPI (если установлена)\n\n"
-        "Фильтрует по регионам:\n"
-        "Индийский океан, Восточно-Китайское, Южно-Китайское,\n"
-        "Филиппинское, Японское, Жёлтое, Берингово, Чукотское,\n"
-        "Австралия, Тихий океан.\n\n"
+        "Фильтрует по регионам.\n\n"
         "Команды:\n"
         "/start — запустить мониторинг\n"
         "/help — справка\n"

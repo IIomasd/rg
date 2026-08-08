@@ -22,11 +22,10 @@ class Config:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не задан!")
 
-    # Используем ADS-B Exchange API
-    ADSB_API_URL = "https://api.adsbexchange.com/aircraft.json"  # публичный эндпоинт
-    # Для авторизованного доступа используйте:
-    # ADSB_API_URL = "https://adsbexchange.com/api/aircraft/json/"
-    ADSB_API_KEY = os.getenv("ADSB_API_KEY", "")  # опционально
+    # Используем альтернативный публичный эндпоинт ADS-B Exchange
+    ADSB_API_URL = "https://data.adsbexchange.com/aircraft.json"
+    # Запасной вариант, если первый не работает:
+    # ADSB_API_URL = "https://api.adsbexchange.com/aircraft.json"
 
     DATABASE_URL = "https://drive.google.com/uc?export=download&id=1sS8a5AZdiXMze8f08iNnVL7kTnlRuarl"
     FALLBACK_DATABASE_URL = "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv"
@@ -152,7 +151,7 @@ def is_target_aircraft(aircraft_type: str) -> bool:
             return True
     return False
 
-# -------------------- ЗАГРУЗЧИК БАЗЫ --------------------
+# -------------------- ЗАГРУЗЧИК БАЗЫ (без изменений) --------------------
 class AircraftDatabase:
     def __init__(self):
         self.data: Dict[str, Dict[str, str]] = {}
@@ -242,7 +241,7 @@ class AircraftDatabase:
     def get(self, icao: str) -> Optional[Dict[str, str]]:
         return self.data.get(icao.lower())
 
-# -------------------- ОСНОВНОЙ КЛАСС ТРЕКЕРА (С ADS-B EXCHANGE) --------------------
+# -------------------- ОСНОВНОЙ КЛАСС ТРЕКЕРА (с исправлением JSON) --------------------
 class AircraftTracker:
     def __init__(self, db: AircraftDatabase):
         self.db = db
@@ -270,21 +269,15 @@ class AircraftTracker:
                     sock_read=60
                 )
                 async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                    # Формируем URL с параметрами (для ADS-B Exchange)
-                    params = {}
-                    if Config.ADSB_API_KEY:
-                        params['api_key'] = Config.ADSB_API_KEY
-                    # Можно добавить фильтр по региону, если нужно
-                    # params['lat'] = 50.0
-                    # params['lng'] = 10.0
-                    # params['distance'] = 1000
-
                     logger.info(f"📡 Запрос к ADS-B Exchange (попытка {attempt})")
-                    async with session.get(
-                        Config.ADSB_API_URL,
-                        params=params,
-                        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-                    ) as response:
+
+                    # Добавляем заголовок Accept, чтобы сервер отдал JSON
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        'Accept': 'application/json'
+                    }
+
+                    async with session.get(Config.ADSB_API_URL, headers=headers) as response:
                         elapsed = (datetime.now() - start_time).total_seconds()
                         logger.info(f"📊 Статус ответа: {response.status} (время {elapsed:.1f}с)")
                         if response.status != 200:
@@ -292,10 +285,18 @@ class AircraftTracker:
                             await asyncio.sleep(5)
                             continue
 
-                        data = await response.json()
+                        # Принудительно парсим JSON, игнорируя Content-Type
+                        try:
+                            data = await response.json(content_type=None)
+                        except Exception as e:
+                            logger.error(f"Ошибка парсинга JSON: {e}")
+                            # Если не удалось, возможно, ответ не JSON – пробуем прочитать текст для диагностики
+                            text = await response.text()
+                            logger.error(f"Получен текст: {text[:200]}...")
+                            raise
+
                         logger.info(f"✅ JSON получен за {(datetime.now() - start_time).total_seconds():.1f}с")
 
-                        # Формат ADS-B Exchange: {'ac': [список бортов]}
                         aircraft_list = data.get('ac', [])
                         if not aircraft_list:
                             logger.info("ℹ️ Список самолётов пуст")
@@ -398,7 +399,7 @@ class AircraftTracker:
             'type': 'N/A'
         }
 
-# -------------------- ОБРАБОТЧИКИ КОМАНД (те же, что были) --------------------
+# -------------------- ОБРАБОТЧИКИ КОМАНД (без изменений) --------------------
 tracker = None
 
 def get_main_keyboard():

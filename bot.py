@@ -55,11 +55,117 @@ class Config:
     DB_RETRY_ATTEMPTS = 3
     DB_RETRY_DELAY = 5
 
-# -------------------- ДАННЫЕ --------------------
-COUNTRY_CODES = { ... }  # оставьте без изменений (полный словарь из предыдущего кода)
-AIRCRAFT_NAMES = { ... }  # оставьте без изменений
+# -------------------- СЛОВАРИ СТРАН И ТИПОВ ВС --------------------
+COUNTRY_CODES = {
+    'A2': '🇧🇼 Ботсвана', 'A3': '🇹🇴 Тонга', 'A4': '🇴🇲 Оман', 'A5': '🇧🇹 Бутан',
+    'A6': '🇦🇪 ОАЭ', 'A7': '🇶🇦 Катар', 'A8': '🇱🇷 Либерия', 'A9': '🇧🇭 Бахрейн',
+    'AP': '🇵🇰 Пакистан', 'B': '🇨🇳 Китай', 'C': '🇨🇦 Канада', 'CC': '🇨🇱 Чили',
+    'CD': '🇨🇩 ДР Конго', 'CR': '🇨🇷 Коста-Рика', 'CU': '🇨🇺 Куба', 'CX': '🇺🇾 Уругвай',
+    'D': '🇩🇪 Германия', 'DQ': '🇫🇯 Фиджи', 'DR': '🇳🇪 Нигер', 'EC': '🇪🇨 Эквадор',
+    'EI': '🇮🇪 Ирландия', 'EK': '🇩🇰 Дания', 'EL': '🇱🇷 Либерия', 'EP': '🇮🇷 Иран',
+    'ER': '🇲🇩 Молдова', 'ES': '🇪🇪 Эстония', 'ET': '🇩🇪 Германия (военные)',
+    'EW': '🇬🇪 Грузия', 'EX': '🇰🇬 Кыргызстан', 'EY': '🇹🇯 Таджикистан', 'F': '🇫🇷 Франция',
+    'G': '🇬🇧 Великобритания', 'H4': '🇸🇧 Соломоновы Острова', 'HA': '🇭🇺 Венгрия',
+    'HB': '🇱🇮 Лихтенштейн', 'HL': '🇰🇷 Южная Корея', 'HP': '🇵🇦 Панама', 'HR': '🇭🇳 Гондурас',
+    'HS': '🇹🇭 Таиланд', 'HU': '🇸🇻 Сальвадор', 'I': '🇮🇹 Италия', 'J': '🇯🇵 Япония',
+    'JA': '🇯🇵 Япония', 'JY': '🇯🇴 Иордания', 'LN': '🇳🇴 Норвегия', 'LV': '🇦🇷 Аргентина',
+    'LZ': '🇧🇬 Болгария', 'N': '🇺🇸 США', 'OB': '🇵🇪 Перу', 'OD': '🇱🇧 Ливан',
+    'OE': '🇸🇦 Саудовская Аравия', 'OH': '🇫🇮 Финляндия', 'OK': '🇨🇿 Чехия',
+    'OM': '🇸🇰 Словакия', 'OO': '🇧🇪 Бельгия', 'OY': '🇩🇰 Дания', 'P': '🇰🇵 Северная Корея',
+    'PH': '🇳🇱 Нидерланды', 'PT': '🇧🇷 Бразилия', 'RA': '🇷🇺 Россия', 'RDPL': '🇱🇦 Лаос',
+    'RP': '🇵🇭 Филиппины', 'SE': '🇸🇪 Швеция', 'SP': '🇵🇱 Польша', 'ST': '🇸🇩 Судан',
+    'SU': '🇪🇬 Египет', 'SX': '🇬🇷 Греция', 'T7': '🇸🇲 Сан-Марино', 'TC': '🇹🇷 Турция',
+    'TF': '🇮🇸 Исландия', 'TG': '🇬🇹 Гватемала', 'TI': '🇨🇷 Коста-Рика', 'TJ': '🇨🇲 Камерун',
+    'TL': '🇨🇫 ЦАР', 'TR': '🇬🇦 Габон', 'TS': '🇹🇳 Тунис', 'TT': '🇨🇭 Швейцария',
+    'TU': '🇨🇮 Кот-д\'Ивуар', 'TY': '🇧🇯 Бенин', 'TZ': '🇲🇱 Мали', 'UR': '🇺🇦 Украина',
+    'V2': '🇦🇬 Антигуа и Барбуда', 'V3': '🇧🇿 Белиз', 'V4': '🇰🇳 Сент-Китс и Невис',
+    'V5': '🇳🇦 Намибия', 'V6': '🇫🇲 Микронезия', 'V7': '🇲🇭 Маршалловы Острова',
+    'V8': '🇧🇳 Бруней', 'XA': '🇲🇽 Мексика', 'XT': '🇧🇫 Буркина-Фасо', 'XY': '🇲🇲 Мьянма',
+    'XZ': '🇲🇳 Монголия', 'YA': '🇦🇫 Афганистан', 'YI': '🇮🇶 Ирак', 'YJ': '🇻🇺 Вануату',
+    'YK': '🇸🇾 Сирия', 'YL': '🇱🇻 Латвия', 'YN': '🇳🇮 Никарагуа', 'YR': '🇷🇴 Румыния',
+    'YS': '🇸🇻 Сальвадор', 'YU': '🇷🇸 Сербия', 'YV': '🇻🇪 Венесуэла', 'Z': '🇿🇦 ЮАР',
+    'ZA': '🇦🇱 Албания', 'ZK': '🇳🇿 Новая Зеландия', 'ZP': '🇵🇾 Парагвай', 'ZS': '🇿🇦 ЮАР',
+    'ZT': '🇿🇲 Замбия', 'ZU': '🇿🇼 Зимбабве', '3B': '🇲🇺 Маврикий', '3C': '🇬🇶 Экв. Гвинея',
+    '3D': '🇸🇿 Эсватини', '3X': '🇬🇳 Гвинея', '4K': '🇦🇿 Азербайджан', '4R': '🇱🇰 Шри-Ланка',
+    '4X': '🇮🇱 Израиль', '5A': '🇱🇾 Ливия', '5B': '🇨🇾 Кипр', '5H': '🇹🇿 Танзания',
+    '5N': '🇳🇬 Нигерия', '5R': '🇲🇬 Мадагаскар', '5T': '🇲🇷 Мавритания', '5U': '🇳🇪 Нигер',
+    '5V': '🇹🇬 Того', '5X': '🇺🇬 Уганда', '6O': '🇸🇴 Сомали', '6V': '🇸🇳 Сенегал',
+    '6W': '🇸🇸 Южный Судан', '7O': '🇾🇪 Йемен', '7P': '🇱🇸 Лесото', '7Q': '🇲🇼 Малави',
+    '7T': '🇩🇿 Алжир', '8P': '🇧🇧 Барбадос', '8Q': '🇲🇻 Мальдивы', '8R': '🇬🇾 Гайана',
+    '9A': '🇭🇷 Хорватия', '9G': '🇬🇭 Гана', '9H': '🇲🇹 Мальта', '9J': '🇿🇲 Замбия',
+    '9K': '🇰🇼 Кувейт', '9L': '🇸🇱 Сьерра-Леоне', '9M': '🇲🇾 Малайзия', '9N': '🇳🇵 Непал',
+    '9Q': '🇨🇩 ДР Конго', '9U': '🇧🇮 Бурунди', '9V': '🇸🇬 Сингапур', '9XR': '🇷🇼 Руанда',
+    'C2': '🇳🇷 Науру', 'D2': '🇦🇴 Ангола', 'D4': '🇨🇻 Кабо-Верде', 'E3': '🇪🇷 Эритрея',
+    'E5': '🇨🇰 Острова Кука', 'HZ': '🇸🇦 Саудовская Аравия', 'J2': '🇩🇯 Джибути',
+    'J3': '🇬🇩 Гренада', 'S7': '🇸🇨 Сейшелы', 'T9': '🇧🇦 Босния и Герцеговина',
+    'UP': '🇰🇿 Казахстан', 'VH': '🇦🇺 Австралия', 'VP-B': '🇧🇲 Бермуды',
+    'VP-L': '🇲🇴 Макао', 'VQ-H': '🇬🇬 Гернси', 'VQ-T': '🇹🇨 Теркс и Кайкос',
+    'Z3': '🇲🇰 Северная Македония'
+}
 
-# Целевые коды – теперь ищем вхождение
+AIRCRAFT_NAMES = {
+    'B52': 'B-52 Stratofortress',
+    'C17': 'C-17 Globemaster III',
+    'F16': 'F-16 Fighting Falcon',
+    'F35': 'F-35 Lightning II',
+    'KC135': 'KC-135 Stratotanker',
+    'KC10': 'KC-10 Extender',
+    'E3': 'E-3 Sentry',
+    'U2': 'U-2 Dragon Lady',
+    'RC135': 'RC-135 Rivet Joint',
+    'C130': 'C-130 Hercules',
+    'A400M': 'A400M Atlas',
+    'P8': 'P-8 Poseidon',
+    'C5': 'C-5 Galaxy',
+    'C2': 'C-2 Greyhound',
+    'KC46': 'KC-46 Pegasus',
+    'DC10': 'DC-10',
+    'P1': 'P-1',
+    'CP140': 'CP-140 Aurora',
+    'F15': 'F-15 Eagle',
+    'F22': 'F-22 Raptor',
+    'F18': 'F/A-18 Hornet',
+    'EA18G': 'EA-18G Growler',
+    'B1': 'B-1 Lancer',
+    'B2': 'B-2 Spirit',
+    'E2': 'E-2 Hawkeye',
+    'E7': 'E-7 Wedgetail',
+    'E4': 'E-4 Nightwatch',
+    'E6': 'E-6 Mercury',
+    'E767': 'E-767',
+    'P3': 'P-3 Orion',
+    'E2C': 'E-2C Hawkeye',
+    'E2K': 'E-2K Hawkeye',
+    'E737': 'E-737 Wedgetail',
+    'C2A': 'C-2A Greyhound',
+    'K35R': 'KC-135R Stratotanker',
+    'R135': 'RC-135',
+    'C30': 'C-30',
+    'C30J': 'C-30J',
+    'C5M': 'C-5M Super Galaxy',
+    'E3TF': 'E-3 Sentry (Турция)',
+    'C17A': 'C-17A Globemaster III',
+    'KC135R': 'KC-135R Stratotanker',
+    'KC135T': 'KC-135T Stratotanker',
+    'KC10A': 'KC-10A Extender',
+    'KC46A': 'KC-46A Pegasus',
+    'F16C': 'F-16C Fighting Falcon',
+    'F15E': 'F-15E Strike Eagle',
+    'F22A': 'F-22A Raptor',
+    'F35A': 'F-35A Lightning II',
+    'F35B': 'F-35B Lightning II',
+    'F35C': 'F-35C Lightning II',
+    'B1B': 'B-1B Lancer',
+    'B2A': 'B-2A Spirit',
+    'E3G': 'E-3G Sentry',
+    'E2D': 'E-2D Advanced Hawkeye',
+    'P8A': 'P-8A Poseidon',
+    'MC130': 'MC-130',
+    'KC130': 'KC-130',
+    'KC130J': 'KC-130J'
+}
+
+# Целевые коды (поиск по вхождению)
 TARGET_CODES = {
     'C130', 'KC130', 'MC130', 'C17', 'C5', 'C2',
     'KC135', 'KC10', 'KC46', 'DC10', 'A400M',
@@ -110,12 +216,95 @@ def is_target_aircraft(aircraft_type: str) -> bool:
             return True
     return False
 
-# -------------------- ЗАГРУЗЧИК БАЗЫ (без изменений) --------------------
+# -------------------- ЗАГРУЗЧИК БАЗЫ ДАННЫХ --------------------
 class AircraftDatabase:
-    # ... (полный код из предыдущей версии, без изменений)
-    pass  # Я опускаю для краткости, но в реальном коде он должен быть полностью
+    def __init__(self):
+        self.data: Dict[str, Dict[str, str]] = {}
+        self._loaded = False
 
-# -------------------- ОСНОВНОЙ ТРЕКЕР (с отладкой) --------------------
+    def load_sync(self):
+        if self._loaded:
+            return
+        if not os.path.exists(Config.LOCAL_DB_FILE):
+            logger.info("Скачиваю базу данных с Google Drive...")
+            self._download_sync()
+        else:
+            logger.info("Загрузка базы из локального файла")
+        self._load_from_file()
+        self._loaded = True
+        logger.info(f"База загружена: {len(self.data)} записей")
+
+    def _download_sync(self):
+        for attempt in range(1, Config.DB_RETRY_ATTEMPTS + 1):
+            try:
+                logger.info(f"Попытка {attempt} из {Config.DB_RETRY_ATTEMPTS} – скачивание с Google Drive")
+                response = requests.get(
+                    Config.DATABASE_URL,
+                    stream=True,
+                    timeout=Config.DB_DOWNLOAD_TIMEOUT,
+                    allow_redirects=True
+                )
+                if response.status_code == 200:
+                    with open(Config.LOCAL_DB_FILE, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    logger.info("База успешно скачана с Google Drive")
+                    return
+                else:
+                    logger.warning(f"Google Drive ответил {response.status_code}, пробую fallback...")
+                    break
+            except Exception as e:
+                logger.warning(f"Ошибка при скачивании с Google Drive (попытка {attempt}): {e}")
+                if attempt < Config.DB_RETRY_ATTEMPTS:
+                    import time
+                    time.sleep(Config.DB_RETRY_DELAY * attempt)
+                else:
+                    logger.info("Попытка скачать с оригинального OpenSky...")
+                    try:
+                        response = requests.get(
+                            Config.FALLBACK_DATABASE_URL,
+                            stream=True,
+                            timeout=Config.DB_DOWNLOAD_TIMEOUT,
+                            allow_redirects=True
+                        )
+                        if response.status_code == 200:
+                            with open(Config.LOCAL_DB_FILE, "wb") as f:
+                                for chunk in response.iter_content(chunk_size=8192):
+                                    if chunk:
+                                        f.write(chunk)
+                            logger.info("База скачана с OpenSky (fallback)")
+                            return
+                    except Exception as e2:
+                        logger.error(f"Ошибка fallback: {e2}")
+
+        logger.error("Не удалось скачать базу данных. Будет использована пустая база.")
+        with open(Config.LOCAL_DB_FILE, "w") as f:
+            f.write("icao24,registration,model\n")
+        self.data = {}
+
+    def _load_from_file(self):
+        try:
+            with open(Config.LOCAL_DB_FILE, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    icao = row.get("icao24", "").strip().lower()
+                    if not icao:
+                        continue
+                    registration = row.get("registration", "").strip()
+                    aircraft_type = row.get("model", "").strip()
+                    self.data[icao] = {
+                        "registration": registration if registration else "N/A",
+                        "type": aircraft_type if aircraft_type else "N/A"
+                    }
+        except Exception as e:
+            logger.error(f"Ошибка чтения базы: {e}")
+            self.data = {}
+
+    def get(self, icao: str) -> Optional[Dict[str, str]]:
+        return self.data.get(icao.lower())
+
+# -------------------- ОСНОВНОЙ ТРЕКЕР --------------------
 class AircraftTracker:
     def __init__(self, db: AircraftDatabase):
         self.db = db
@@ -264,7 +453,7 @@ class AircraftTracker:
 
         return new_detections
 
-# -------------------- ОБРАБОТЧИКИ КОМАНД (без изменений) --------------------
+# -------------------- ОБРАБОТЧИКИ КОМАНД --------------------
 tracker = None
 
 def get_main_keyboard():

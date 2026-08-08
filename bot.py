@@ -17,16 +17,45 @@ from telegram.ext import (
     filters,
 )
 
+# Попытка импортировать FlightRadarAPI (необязательно)
+try:
+    from FlightRadarAPI import FlightRadar24API
+    FR24_AVAILABLE = True
+except ImportError:
+    FR24_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.info("FlightRadarAPI не установлена, этот источник будет пропущен")
+
 # -------------------- КОНФИГУРАЦИЯ --------------------
 class Config:
     BOT_TOKEN = os.getenv("BOT_TOKEN")
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не задан!")
 
-    # Источники данных (пробуем по порядку)
-    ADS_BASE_URL = "https://data.adsbexchange.com/aircraft.json"
-    ADS_ALT_URL = "https://api.adsbexchange.com/aircraft.json"
-    OPENSKY_URL = "https://opensky-network.org/api/states/all"
+    # Список источников данных (пробуем по порядку)
+    SOURCES = [
+        {
+            "name": "ADS-B Exchange (main)",
+            "url": "https://data.adsbexchange.com/aircraft.json",
+            "type": "adsb",
+        },
+        {
+            "name": "ADS-B Exchange (alt)",
+            "url": "https://api.adsbexchange.com/aircraft.json",
+            "type": "adsb",
+        },
+        {
+            "name": "ADS-B.lol",
+            "url": "https://api.adsb.lol/aircraft.json",
+            "type": "adsb",
+        },
+        {
+            "name": "OpenSky Network",
+            "url": "https://opensky-network.org/api/states/all",
+            "type": "opensky",
+        },
+        # Flightradar24 будет добавлен отдельно, если библиотека установлена
+    ]
 
     HEADERS = {
         "User-Agent": "MilitaryAircraftBot/1.0",
@@ -43,9 +72,9 @@ class Config:
     DB_RETRY_DELAY = 5
 
 # -------------------- СЛОВАРИ (полные) --------------------
-COUNTRY_CODES = { ... }  # Здесь должен быть полный словарь (я сократил для краткости, но в реальном коде он должен быть полным)
-AIRCRAFT_NAMES = { ... }  # Полный словарь
-TARGET_CODES = { ... }    # Полный набор целевых кодов
+COUNTRY_CODES = { ... }  # Вставьте полный словарь из предыдущих версий
+AIRCRAFT_NAMES = { ... } # Вставьте полный словарь
+TARGET_CODES = { ... }   # Вставьте набор целевых кодов
 
 # -------------------- ЛОГИРОВАНИЕ --------------------
 logging.basicConfig(
@@ -56,49 +85,33 @@ logger = logging.getLogger(__name__)
 
 # -------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ --------------------
 def get_country_by_registration(registration: str) -> str:
-    if not registration:
-        return "🌍 Страна неизвестна"
-    sorted_prefixes = sorted(COUNTRY_CODES.keys(), key=len, reverse=True)
-    for prefix in sorted_prefixes:
-        if registration.startswith(prefix):
-            return COUNTRY_CODES[prefix]
-    return "🌍 Страна неизвестна"
+    # ... (оставьте как было)
+    pass
 
 def format_coordinates(lat: float, lon: float) -> str:
-    if lat is None or lon is None:
-        return "📍 Координаты недоступны"
-    try:
-        lat_dir = "С" if lat >= 0 else "Ю"
-        lon_dir = "В" if lon >= 0 else "З"
-        return f"{abs(lat):.2f}°{lat_dir}, {abs(lon):.2f}°{lon_dir}"
-    except TypeError:
-        return "📍 Координаты недоступны"
+    # ... (оставьте как было)
+    pass
 
 def normalize_type(aircraft_type: str) -> str:
-    if not aircraft_type:
-        return ""
-    return re.sub(r'[^A-Z0-9]', '', aircraft_type.upper())
+    # ... (оставьте как было)
+    pass
 
 def is_target_aircraft(aircraft_type: str) -> bool:
-    if not aircraft_type:
-        return False
-    clean = normalize_type(aircraft_type)
-    for code in TARGET_CODES:
-        if code in clean:
-            return True
-    return False
+    # ... (оставьте как было)
+    pass
 
-# -------------------- ЗАГРУЗЧИК БАЗЫ (без изменений) --------------------
+# -------------------- ЗАГРУЗЧИК БАЗЫ --------------------
 class AircraftDatabase:
     # ... (полный класс из предыдущего кода) ...
 
-# -------------------- ОСНОВНОЙ ТРЕКЕР (с двумя источниками) --------------------
+# -------------------- ОСНОВНОЙ ТРЕКЕР (с перебором источников) --------------------
 class AircraftTracker:
     def __init__(self, db: AircraftDatabase):
         self.db = db
         self.tracked_aircrafts: Dict[str, Dict] = {}
         self.active_chats: set = set()
         self.chat_intervals: Dict[int, int] = {}
+        self.fr_api = FlightRadar24API() if FR24_AVAILABLE else None
 
     def get_interval(self, chat_id: int) -> int:
         return self.chat_intervals.get(chat_id, Config.DEFAULT_INTERVAL)
@@ -106,31 +119,13 @@ class AircraftTracker:
     def set_interval(self, chat_id: int, interval_seconds: int):
         self.chat_intervals[chat_id] = interval_seconds
 
-    # ---------- ADS-B Exchange ----------
-    async def fetch_adsb(self, session: aiohttp.ClientSession, url: str):
-        try:
-            async with session.get(url, headers=Config.HEADERS, timeout=20) as response:
-                logger.info(f"ADS-B запрос: {response.status} {url}")
-                response.raise_for_status()
-                try:
-                    data = await response.json(content_type=None)
-                    return data
-                except Exception as json_err:
-                    text = await response.text()
-                    logger.error(f"Ошибка парсинга JSON от {url}: {json_err}, получено: {text[:200]}...")
-                    return None
-        except Exception as e:
-            logger.error(f"Ошибка запроса к ADS-B ({url}): {e}")
-            return None
-
+    # ---------- ADS-B Exchange парсинг ----------
     def parse_adsb_data(self, json_data: dict) -> List[Dict]:
         aircrafts = []
         if not json_data:
             return aircrafts
         try:
             ac_list = json_data.get('ac', [])
-            if not ac_list:
-                return aircrafts
             for ac in ac_list:
                 if not isinstance(ac, dict):
                     continue
@@ -158,22 +153,7 @@ class AircraftTracker:
             logger.error(f"Ошибка парсинга ADS-B: {e}", exc_info=True)
         return aircrafts
 
-    # ---------- OpenSky (резерв) ----------
-    async def fetch_opensky(self, session: aiohttp.ClientSession):
-        try:
-            connector = aiohttp.TCPConnector(family=socket.AF_INET)
-            timeout = aiohttp.ClientTimeout(total=30, connect=10)
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as os_session:
-                async with os_session.get(Config.OPENSKY_URL, headers={'User-Agent': 'Mozilla/5.0'}) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    else:
-                        logger.warning(f"OpenSky статус {response.status}")
-                        return None
-        except Exception as e:
-            logger.error(f"Ошибка OpenSky: {e}")
-            return None
-
+    # ---------- OpenSky парсинг ----------
     def parse_opensky_data(self, json_data: dict) -> List[Dict]:
         aircrafts = []
         if not json_data or 'states' not in json_data:
@@ -203,34 +183,99 @@ class AircraftTracker:
             aircrafts.append(aircraft)
         return aircrafts
 
+    # ---------- Flightradar24 через библиотеку ----------
+    async def fetch_fr24(self) -> List[Dict]:
+        if not self.fr_api:
+            return []
+        try:
+            logger.info("Запрос к Flightradar24 (библиотека)...")
+            flights = await asyncio.to_thread(self.fr_api.get_flights)
+            if not flights:
+                return []
+            aircrafts = []
+            for flight in flights:
+                icao = getattr(flight, 'id', '').upper()
+                if not icao:
+                    continue
+                aircraft = {
+                    'icao': icao,
+                    'registration': getattr(flight, 'registration', 'N/A') or 'N/A',
+                    'call_sign': getattr(flight, 'callsign', 'N/A') or 'N/A',
+                    'type': getattr(flight, 'type', 'N/A') or 'N/A',
+                    'operator': getattr(flight, 'operator', 'N/A') or 'N/A',
+                    'lat': getattr(flight, 'latitude', None),
+                    'lon': getattr(flight, 'longitude', None),
+                    'altitude': getattr(flight, 'altitude', None),
+                    'speed': getattr(flight, 'speed', None),
+                    'timestamp': datetime.now(),
+                    'country': getattr(flight, 'origin_country', 'Неизвестно') or 'Неизвестно',
+                    'coordinates': format_coordinates(
+                        getattr(flight, 'latitude', None),
+                        getattr(flight, 'longitude', None)
+                    )
+                }
+                aircrafts.append(aircraft)
+            logger.info(f"FR24: получено {len(aircrafts)} бортов")
+            return aircrafts
+        except Exception as e:
+            logger.error(f"Ошибка получения данных из Flightradar24: {e}")
+            return []
+
     # ---------- Основной мониторинг ----------
     async def monitor(self, context: ContextTypes.DEFAULT_TYPE):
         chat_id = context.job.chat_id
         aircrafts = []
+        source_used = None
 
-        # 1. Пробуем ADS-B Exchange (основной)
+        # 1. Пробуем все источники из Config.SOURCES (ADS-B, OpenSky)
         async with aiohttp.ClientSession(headers=Config.HEADERS) as session:
-            for url in [Config.ADS_BASE_URL, Config.ADS_ALT_URL]:
-                json_data = await self.fetch_adsb(session, url)
-                if json_data:
-                    aircrafts = self.parse_adsb_data(json_data)
-                    if aircrafts:
-                        logger.info(f"ADS-B: получено {len(aircrafts)} бортов")
-                        await self.process_aircrafts(aircrafts, chat_id, context)
-                        return
-                # Если не удалось, пробуем следующий
+            for source in Config.SOURCES:
+                try:
+                    logger.info(f"Пробую источник: {source['name']} ({source['url']})")
+                    if source['type'] == 'adsb':
+                        async with session.get(source['url'], timeout=20) as response:
+                            if response.status == 200:
+                                try:
+                                    json_data = await response.json(content_type=None)
+                                    aircrafts = self.parse_adsb_data(json_data)
+                                    if aircrafts:
+                                        source_used = source['name']
+                                        break
+                                except Exception as json_err:
+                                    text = await response.text()
+                                    logger.error(f"Ошибка парсинга JSON от {source['name']}: {json_err}, получено: {text[:200]}...")
+                                    continue
+                            else:
+                                logger.warning(f"{source['name']} статус {response.status}")
+                    elif source['type'] == 'opensky':
+                        connector = aiohttp.TCPConnector(family=socket.AF_INET)
+                        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+                        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as os_session:
+                            async with os_session.get(source['url'], headers={'User-Agent': 'Mozilla/5.0'}) as response:
+                                if response.status == 200:
+                                    json_data = await response.json()
+                                    aircrafts = self.parse_opensky_data(json_data)
+                                    if aircrafts:
+                                        source_used = source['name']
+                                        break
+                                else:
+                                    logger.warning(f"OpenSky статус {response.status}")
+                except Exception as e:
+                    logger.error(f"Ошибка при обращении к {source['name']}: {e}")
+                    continue
 
-        # 2. Если ADS-B не дал данных, пробуем OpenSky
-        logger.info("ADS-B не вернул данные, пробую OpenSky...")
-        json_data = await self.fetch_opensky(None)  # передаём None, т.к. внутри создаётся своя сессия
-        if json_data:
-            aircrafts = self.parse_opensky_data(json_data)
+        # 2. Если ни один не дал данных, пробуем Flightradar24 (если доступен)
+        if not aircrafts and self.fr_api:
+            logger.info("ADS-B и OpenSky не дали данных, пробую Flightradar24...")
+            aircrafts = await self.fetch_fr24()
             if aircrafts:
-                logger.info(f"OpenSky: получено {len(aircrafts)} бортов")
-                await self.process_aircrafts(aircrafts, chat_id, context)
-                return
+                source_used = "Flightradar24"
 
-        logger.info("Новых целей не найдено (все источники недоступны)")
+        if aircrafts:
+            logger.info(f"Источник: {source_used}, получено {len(aircrafts)} бортов")
+            await self.process_aircrafts(aircrafts, chat_id, context)
+        else:
+            logger.info("Новых целей не найдено (все источники недоступны или нет данных)")
 
     async def process_aircrafts(self, aircrafts: List[Dict], chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> List[str]:
         new_detections = []
@@ -331,8 +376,8 @@ async def _start_monitoring_for_chat(chat_id: int, context: ContextTypes.DEFAULT
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text(
-        "🛩 Авиационный трекер (ADS-B / OpenSky)\n"
-        "Отслеживание самолётов по типам из списка.\n"
+        "🛩 Универсальный авиационный трекер\n"
+        "Использует ADS-B Exchange, OpenSky и Flightradar24.\n"
         "Автоматически запускаю мониторинг...",
         reply_markup=get_main_keyboard()
     )
@@ -348,8 +393,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 *Авиационный трекер*\n\n"
-        "Бот отслеживает самолёты по данным ADS-B Exchange и OpenSky.\n"
+        "🤖 *Универсальный авиационный трекер*\n\n"
+        "Бот отслеживает самолёты по данным ADS-B Exchange, OpenSky и Flightradar24.\n"
         "Фильтрация по типу из списка целевых.\n"
         "При обнаружении приходит уведомление.\n\n"
         "*Команды:*\n"

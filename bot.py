@@ -13,8 +13,8 @@ from telegram.ext import (
     filters,
 )
 
-# Импорт библиотеки FlightRadarAPI
-from FlightRadar24 import FlightRadar24API
+# Правильный импорт библиотеки Flightradar24
+from FlightRadarAPI import FlightRadar24API
 
 # -------------------- КОНФИГУРАЦИЯ --------------------
 class Config:
@@ -30,7 +30,7 @@ class Config:
     DB_RETRY_ATTEMPTS = 3
     DB_RETRY_DELAY = 5
 
-# -------------------- ДАННЫЕ --------------------
+# -------------------- ДАННЫЕ (без изменений) --------------------
 AIRCRAFT_NAMES = {
     'B52': 'B-52 Stratofortress',
     'C17': 'C-17 Globemaster III',
@@ -241,7 +241,6 @@ class AircraftTracker:
         self.tracked_aircrafts: Dict[str, Dict] = {}
         self.active_chats: set = set()
         self.chat_intervals: Dict[int, int] = {}
-        # Инициализация клиента Flightradar24
         self.fr_api = FlightRadar24API()
 
     def get_interval(self, chat_id: int) -> int:
@@ -257,7 +256,6 @@ class AircraftTracker:
         try:
             logger.info("📡 Запрос к Flightradar24...")
             # Получаем список всех активных рейсов
-            # get_flights() возвращает список объектов Flight
             flights = await asyncio.to_thread(self.fr_api.get_flights)
             
             if not flights:
@@ -265,10 +263,11 @@ class AircraftTracker:
                 return
 
             logger.info(f"✈️ Получено {len(flights)} рейсов от Flightradar24")
+            target_count = 0
 
             for flight in flights:
-                # Извлекаем данные из объекта Flight
-                icao = getattr(flight, 'hex', '').upper()
+                # Извлекаем ICAO (в библиотеке это поле 'id')
+                icao = getattr(flight, 'id', '').upper()
                 if not icao:
                     continue
 
@@ -285,9 +284,17 @@ class AircraftTracker:
                     aircraft_type = "N/A"
                     registration = "N/A"
 
+                # Если тип не определён, пытаемся получить его напрямую из flight
+                if aircraft_type == "N/A":
+                    # В объекте Flight может быть поле 'type' или 'aircraft_type'
+                    aircraft_type = getattr(flight, 'type', 'N/A') or 'N/A'
+
                 # Фильтрация по типу
                 if not is_target_aircraft(aircraft_type):
                     continue
+
+                target_count += 1
+                logger.info(f"🎯 Найден военный: {icao} ({aircraft_type})")
 
                 # Собираем данные для отправки
                 callsign = getattr(flight, 'callsign', 'N/A') or 'N/A'
@@ -328,12 +335,15 @@ class AircraftTracker:
                     text=message,
                     disable_web_page_preview=True
                 )
-                logger.info(f"✅ Обнаружение: {icao} ({type_name})")
+                logger.info(f"✅ Обнаружение отправлено: {icao} ({type_name})")
+
+            if target_count == 0:
+                logger.info("ℹ️ Военных целей не найдено в текущем наборе")
 
         except Exception as e:
             logger.error(f"❌ Ошибка при запросе к Flightradar24: {e}", exc_info=True)
 
-# -------------------- ОБРАБОТЧИКИ КОМАНД --------------------
+# -------------------- ОБРАБОТЧИКИ КОМАНД (без изменений) --------------------
 tracker = None
 
 def get_main_keyboard():

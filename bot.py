@@ -22,12 +22,17 @@ class Config:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не задан!")
 
-    API_URL = "https://opensky-network.org/api/states/all"
+    # Используем ADS-B Exchange API
+    ADSB_API_URL = "https://api.adsbexchange.com/aircraft.json"  # публичный эндпоинт
+    # Для авторизованного доступа используйте:
+    # ADSB_API_URL = "https://adsbexchange.com/api/aircraft/json/"
+    ADSB_API_KEY = os.getenv("ADSB_API_KEY", "")  # опционально
+
     DATABASE_URL = "https://drive.google.com/uc?export=download&id=1sS8a5AZdiXMze8f08iNnVL7kTnlRuarl"
     FALLBACK_DATABASE_URL = "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv"
     LOCAL_DB_FILE = "aircraftDatabase.csv"
-    DEFAULT_INTERVAL = 600          # 10 минут
-    REQUEST_TIMEOUT = 90            # общий таймаут
+    DEFAULT_INTERVAL = 600
+    REQUEST_TIMEOUT = 90
     DB_DOWNLOAD_TIMEOUT = 90
     DB_RETRY_ATTEMPTS = 3
     DB_RETRY_DELAY = 5
@@ -237,7 +242,7 @@ class AircraftDatabase:
     def get(self, icao: str) -> Optional[Dict[str, str]]:
         return self.data.get(icao.lower())
 
-# -------------------- ОСНОВНОЙ КЛАСС ТРЕКЕРА --------------------
+# -------------------- ОСНОВНОЙ КЛАСС ТРЕКЕРА (С ADS-B EXCHANGE) --------------------
 class AircraftTracker:
     def __init__(self, db: AircraftDatabase):
         self.db = db
@@ -257,7 +262,6 @@ class AircraftTracker:
 
         for attempt in range(1, 4):
             try:
-                # Создаём новую сессию для каждой попытки
                 connector = aiohttp.TCPConnector(family=socket.AF_INET)
                 timeout = aiohttp.ClientTimeout(
                     total=Config.REQUEST_TIMEOUT,
@@ -266,9 +270,19 @@ class AircraftTracker:
                     sock_read=60
                 )
                 async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                    logger.info(f"📡 Запрос к {Config.API_URL} (попытка {attempt})")
+                    # Формируем URL с параметрами (для ADS-B Exchange)
+                    params = {}
+                    if Config.ADSB_API_KEY:
+                        params['api_key'] = Config.ADSB_API_KEY
+                    # Можно добавить фильтр по региону, если нужно
+                    # params['lat'] = 50.0
+                    # params['lng'] = 10.0
+                    # params['distance'] = 1000
+
+                    logger.info(f"📡 Запрос к ADS-B Exchange (попытка {attempt})")
                     async with session.get(
-                        Config.API_URL,
+                        Config.ADSB_API_URL,
+                        params=params,
                         headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
                     ) as response:
                         elapsed = (datetime.now() - start_time).total_seconds()
@@ -281,15 +295,16 @@ class AircraftTracker:
                         data = await response.json()
                         logger.info(f"✅ JSON получен за {(datetime.now() - start_time).total_seconds():.1f}с")
 
-                        if 'states' not in data or not data['states']:
+                        # Формат ADS-B Exchange: {'ac': [список бортов]}
+                        aircraft_list = data.get('ac', [])
+                        if not aircraft_list:
                             logger.info("ℹ️ Список самолётов пуст")
                             return
 
-                        states = data['states']
-                        logger.info(f"✈️ Получено самолётов: {len(states)}")
+                        logger.info(f"✈️ Получено самолётов: {len(aircraft_list)}")
 
-                        for state in states:
-                            aircraft = self.parse_aircraft(state)
+                        for ac in aircraft_list:
+                            aircraft = self.parse_aircraft_adsb(ac)
                             if not aircraft:
                                 continue
 
@@ -357,36 +372,33 @@ class AircraftTracker:
                 logger.error(f"❌ Непредвиденная ошибка: {e}", exc_info=True)
                 return
 
-    def parse_aircraft(self, state: List) -> Optional[Dict]:
-        if not isinstance(state, list) or len(state) < 7:
-            return None
-        icao = state[0] or 'N/A'
-        if icao == 'N/A':
-            return None
-
-        on_ground = state[8] if len(state) > 8 else None
-        if on_ground:
+    def parse_aircraft_adsb(self, ac: Dict) -> Optional[Dict]:
+        """Парсинг одного объекта от ADS-B Exchange"""
+        icao = ac.get('hex', '').upper()
+        if not icao:
             return None
 
-        callsign = (state[1] or '').strip()
-        if not callsign:
-            callsign = 'N/A'
-        country = (state[2] or '').strip() or 'Неизвестно'
-        longitude = state[5] if len(state) > 5 else None
-        latitude = state[6] if len(state) > 6 else None
+        # Фильтруем наземные (если есть поле 'gnd' и оно True)
+        if ac.get('gnd', False):
+            return None
+
+        callsign = ac.get('flight', '').strip() or 'N/A'
+        country = ac.get('country', 'Неизвестно')
+        lat = ac.get('lat')
+        lon = ac.get('lon')
 
         return {
             'icao': icao,
             'call_sign': callsign,
             'country': country,
-            'lat': latitude,
-            'lon': longitude,
+            'lat': lat,
+            'lon': lon,
             'timestamp': datetime.now(),
             'registration': 'N/A',
             'type': 'N/A'
         }
 
-# -------------------- ОБРАБОТЧИКИ КОМАНД --------------------
+# -------------------- ОБРАБОТЧИКИ КОМАНД (те же, что были) --------------------
 tracker = None
 
 def get_main_keyboard():
@@ -412,15 +424,11 @@ def get_interval_keyboard():
 async def _start_monitoring_for_chat(chat_id: int, context: ContextTypes.DEFAULT_TYPE, interval: Optional[int] = None):
     if context.job_queue is None:
         raise RuntimeError("JobQueue не доступен.")
-
-    # Удаляем старые задачи
     jobs = context.job_queue.get_jobs_by_name(str(chat_id))
     for job in jobs:
         job.schedule_removal()
-
     if interval is None:
         interval = tracker.get_interval(chat_id)
-
     context.job_queue.run_repeating(
         tracker.monitor,
         interval=timedelta(seconds=interval),
@@ -435,8 +443,8 @@ async def _start_monitoring_for_chat(chat_id: int, context: ContextTypes.DEFAULT
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text(
-        "🛩 Военный авиационный трекер\n"
-        "Отслеживание военных самолётов по типу (OpenSky).\n"
+        "🛩 Военный авиационный трекер (ADS-B Exchange)\n"
+        "Отслеживание военных самолётов.\n"
         "Автоматически запускаю мониторинг...",
         reply_markup=get_main_keyboard()
     )
@@ -453,7 +461,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Военный авиационный трекер*\n\n"
-        "Бот отслеживает военные самолёты по данным OpenSky Network.\n"
+        "Бот отслеживает военные самолёты по данным ADS-B Exchange.\n"
         "Фильтрация по типу из списка целевых.\n"
         "При обнаружении приходит уведомление.\n\n"
         "*Команды:*\n"
@@ -535,7 +543,6 @@ async def handle_interval_choice(update: Update, context: ContextTypes.DEFAULT_T
     if text in interval_map:
         new_interval = interval_map[text]
         tracker.set_interval(chat_id, new_interval)
-
         if chat_id in tracker.active_chats:
             try:
                 await _start_monitoring_for_chat(chat_id, context, new_interval)

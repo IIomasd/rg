@@ -21,9 +21,6 @@ class Config:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не задан!")
 
-    # Режим отладки: если True, бот отправляет все самолёты без фильтрации
-    DEBUG_MODE = True   # Установите True для теста, затем верните False
-
     # Flightradar24
     FR24_URL = "https://data-cloud.flightradar24.com/zones/fcgi/feed.js"
     FR24_PARAMS = {
@@ -59,7 +56,7 @@ class Config:
     DB_RETRY_ATTEMPTS = 3
     DB_RETRY_DELAY = 5
 
-# -------------------- ДАННЫЕ (без изменений) --------------------
+# -------------------- ДАННЫЕ --------------------
 COUNTRY_CODES = {
     'A2': '🇧🇼 Ботсвана', 'A3': '🇹🇴 Тонга', 'A4': '🇴🇲 Оман', 'A5': '🇧🇹 Бутан',
     'A6': '🇦🇪 ОАЭ', 'A7': '🇶🇦 Катар', 'A8': '🇱🇷 Либерия', 'A9': '🇧🇭 Бахрейн',
@@ -169,22 +166,14 @@ AIRCRAFT_NAMES = {
     'KC130J': 'KC-130J'
 }
 
-TARGET_TYPES = {
-    'exact': {
-        'C130', 'KC130', 'MC130', 'KC130J', 'C17', 'C5',
-        'C2', 'KC135', 'KC10', 'KC46', 'DC10', 'A400M',
-        'P1', 'CP140', 'F16', 'F15', 'F22', 'F35', 'F18',
-        'EA18G', 'B1', 'B2', 'B52', 'E3', 'E2', 'E8', 'E7',
-        'E4', 'E6', 'E767', 'P3', 'P8', 'U2', 'RC135', 'E2C',
-        'E2K', 'E737', 'C2A', 'K35R', 'R135', 'C30', 'C30J',
-        'C5M', 'E3TF'
-    },
-    'partial': {
-        'C17A', 'KC135R', 'KC135T', 'KC10A', 'KC46A',
-        'F16C', 'F15E', 'F22A', 'F35A', 'F35B', 'F35C',
-        'EA18G', 'B1B', 'B2A', 'B52', 'E3G', 'E2D', 'P8A', 'MC130',
-        'K35R', 'R135', 'C30', 'C30J', 'E3TF'
-    }
+# Целевые типы – теперь мы ищем вхождение этих кодов в строку типа
+TARGET_CODES = {
+    'C130', 'KC130', 'MC130', 'C17', 'C5', 'C2',
+    'KC135', 'KC10', 'KC46', 'DC10', 'A400M',
+    'P1', 'CP140', 'F16', 'F15', 'F22', 'F35', 'F18',
+    'EA18G', 'B1', 'B2', 'B52', 'E3', 'E2', 'E8', 'E7',
+    'E4', 'E6', 'E767', 'P3', 'P8', 'U2', 'RC135',
+    'C30', 'K35R', 'R135', 'C30J', 'C5M'
 }
 
 # -------------------- ЛОГИРОВАНИЕ --------------------
@@ -194,7 +183,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# -------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (без изменений) --------------------
+# -------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ --------------------
 def get_country_by_registration(registration: str) -> str:
     if not registration:
         return "🌍 Страна неизвестна"
@@ -217,20 +206,24 @@ def format_coordinates(lat: float, lon: float) -> str:
 def normalize_type(aircraft_type: str) -> str:
     if not aircraft_type:
         return ""
-    return aircraft_type.replace("-", "").replace(" ", "").replace("_", "")
+    # Удаляем лишние символы, но оставляем буквы и цифры
+    import re
+    clean = re.sub(r'[^A-Z0-9]', '', aircraft_type.upper())
+    return clean
 
 def is_target_aircraft(aircraft_type: str) -> bool:
+    """Проверяет, содержится ли любой из целевых кодов в строке типа"""
     if not aircraft_type:
         return False
     clean = normalize_type(aircraft_type)
-    if clean in TARGET_TYPES['exact']:
-        return True
-    for part in TARGET_TYPES['partial']:
-        if part in clean:
+    # Проверяем, входит ли какой-либо код в clean
+    for code in TARGET_CODES:
+        if code in clean:
+            logger.debug(f"Найдено совпадение: {code} в {clean}")
             return True
     return False
 
-# -------------------- ЗАГРУЗЧИК БАЗЫ (без изменений) --------------------
+# -------------------- ЗАГРУЗЧИК БАЗЫ --------------------
 class AircraftDatabase:
     def __init__(self):
         self.data: Dict[str, Dict[str, str]] = {}
@@ -318,7 +311,7 @@ class AircraftDatabase:
     def get(self, icao: str) -> Optional[Dict[str, str]]:
         return self.data.get(icao.lower())
 
-# -------------------- ОСНОВНОЙ ТРЕКЕР (с отладочным режимом) --------------------
+# -------------------- ОСНОВНОЙ ТРЕКЕР --------------------
 class AircraftTracker:
     def __init__(self, db: AircraftDatabase):
         self.db = db
@@ -423,24 +416,11 @@ class AircraftTracker:
                 registration = aircraft.get('registration', 'N/A')
 
             if aircraft_type == 'N/A':
-                # Если тип не найден в базе, используем тип из FR24 (если он есть)
-                if aircraft.get('type'):
-                    aircraft_type = aircraft['type']
-                else:
-                    continue
+                continue
 
-            # Логируем тип для отладки
-            logger.info(f"Проверка типа: '{aircraft_type}' (нормализованный: '{normalize_type(aircraft_type)}') для ICAO {icao}")
+            if not is_target_aircraft(aircraft_type):
+                continue
 
-            # Проверка фильтра
-            if Config.DEBUG_MODE:
-                # В режиме отладки отправляем все самолёты
-                pass
-            else:
-                if not is_target_aircraft(aircraft_type):
-                    continue
-
-            # Если дошли сюда, значит самолёт подходит (или режим отладки)
             aircraft['type'] = aircraft_type
             aircraft['registration'] = registration if registration != 'N/A' else aircraft.get('registration', 'N/A')
             self.tracked_aircrafts[icao] = aircraft
@@ -473,7 +453,7 @@ class AircraftTracker:
 
         return new_detections
 
-# -------------------- ОБРАБОТЧИКИ КОМАНД (без изменений) --------------------
+# -------------------- ОБРАБОТЧИКИ КОМАНД --------------------
 tracker = None
 
 def get_main_keyboard():

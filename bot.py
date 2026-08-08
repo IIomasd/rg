@@ -308,7 +308,7 @@ class AircraftTracker:
                         type_name = AIRCRAFT_NAMES.get(clean_type, aircraft_type if aircraft_type != "N/A" else "Неизвестен")
                         
                         message = (
-                            "🚨 Военный самолет обнаружен!\n"
+                            "🚨 Самолет обнаружен!\n"
                             f"🕒 Время: {aircraft['timestamp'].strftime('%d.%m.%Y %H:%M:%S')}\n"
                             f"▫️ ICAO: {icao}\n"
                             f"▫️ Позывной: {aircraft['call_sign']}\n"

@@ -21,6 +21,9 @@ class Config:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не задан!")
 
+    # Режим отладки: если True, бот отправляет все самолёты без фильтрации
+    DEBUG_MODE = False   # Установите True для теста, затем верните False
+
     # Flightradar24
     FR24_URL = "https://data-cloud.flightradar24.com/zones/fcgi/feed.js"
     FR24_PARAMS = {
@@ -56,7 +59,7 @@ class Config:
     DB_RETRY_ATTEMPTS = 3
     DB_RETRY_DELAY = 5
 
-# -------------------- ДАННЫЕ --------------------
+# -------------------- ДАННЫЕ (без изменений) --------------------
 COUNTRY_CODES = {
     'A2': '🇧🇼 Ботсвана', 'A3': '🇹🇴 Тонга', 'A4': '🇴🇲 Оман', 'A5': '🇧🇹 Бутан',
     'A6': '🇦🇪 ОАЭ', 'A7': '🇶🇦 Катар', 'A8': '🇱🇷 Либерия', 'A9': '🇧🇭 Бахрейн',
@@ -191,7 +194,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# -------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ --------------------
+# -------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (без изменений) --------------------
 def get_country_by_registration(registration: str) -> str:
     if not registration:
         return "🌍 Страна неизвестна"
@@ -227,7 +230,7 @@ def is_target_aircraft(aircraft_type: str) -> bool:
             return True
     return False
 
-# -------------------- ЗАГРУЗЧИК БАЗЫ --------------------
+# -------------------- ЗАГРУЗЧИК БАЗЫ (без изменений) --------------------
 class AircraftDatabase:
     def __init__(self):
         self.data: Dict[str, Dict[str, str]] = {}
@@ -315,7 +318,7 @@ class AircraftDatabase:
     def get(self, icao: str) -> Optional[Dict[str, str]]:
         return self.data.get(icao.lower())
 
-# -------------------- ОСНОВНОЙ ТРЕКЕР --------------------
+# -------------------- ОСНОВНОЙ ТРЕКЕР (с отладочным режимом) --------------------
 class AircraftTracker:
     def __init__(self, db: AircraftDatabase):
         self.db = db
@@ -368,7 +371,7 @@ class AircraftTracker:
                         'registration': (data[9] or '').strip(),
                         'call_sign': (data[16] or '').strip(),
                         'type': aircraft_type,
-                        'operator': (data[18] or '').strip(),  # сохраняем для внутреннего использования, но не выводим
+                        'operator': (data[18] or '').strip(),
                         'lat': data[1] if len(data) > 1 else None,
                         'lon': data[2] if len(data) > 2 else None,
                         'timestamp': datetime.now()
@@ -420,11 +423,24 @@ class AircraftTracker:
                 registration = aircraft.get('registration', 'N/A')
 
             if aircraft_type == 'N/A':
-                continue
+                # Если тип не найден в базе, используем тип из FR24 (если он есть)
+                if aircraft.get('type'):
+                    aircraft_type = aircraft['type']
+                else:
+                    continue
 
-            if not is_target_aircraft(aircraft_type):
-                continue
+            # Логируем тип для отладки
+            logger.info(f"Проверка типа: '{aircraft_type}' (нормализованный: '{normalize_type(aircraft_type)}') для ICAO {icao}")
 
+            # Проверка фильтра
+            if Config.DEBUG_MODE:
+                # В режиме отладки отправляем все самолёты
+                pass
+            else:
+                if not is_target_aircraft(aircraft_type):
+                    continue
+
+            # Если дошли сюда, значит самолёт подходит (или режим отладки)
             aircraft['type'] = aircraft_type
             aircraft['registration'] = registration if registration != 'N/A' else aircraft.get('registration', 'N/A')
             self.tracked_aircrafts[icao] = aircraft
@@ -432,7 +448,6 @@ class AircraftTracker:
             clean_type = normalize_type(aircraft_type)
             type_name = AIRCRAFT_NAMES.get(clean_type, aircraft_type)
 
-            # Формируем сообщение — без оператора, без высоты, без скорости
             message = (
                 "🚨 Самолет обнаружен!\n"
                 f"🕒 Время: {aircraft['timestamp'].strftime('%d.%m.%Y %H:%M:%S')}\n"
@@ -458,7 +473,7 @@ class AircraftTracker:
 
         return new_detections
 
-# -------------------- ОБРАБОТЧИКИ КОМАНД --------------------
+# -------------------- ОБРАБОТЧИКИ КОМАНД (без изменений) --------------------
 tracker = None
 
 def get_main_keyboard():

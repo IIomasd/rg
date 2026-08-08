@@ -22,7 +22,7 @@ class Config:
         raise ValueError("BOT_TOKEN не задан!")
 
     # Режим отладки: если True, бот отправляет все самолёты без фильтрации
-    DEBUG_MODE = False   # Установите True для теста, затем верните False
+    DEBUG_MODE = True   # Установите True для теста, затем верните False
 
     # Flightradar24
     FR24_URL = "https://data-cloud.flightradar24.com/zones/fcgi/feed.js"

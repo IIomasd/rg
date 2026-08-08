@@ -30,9 +30,8 @@ class Config:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не задан!")
 
-    # Прокси (из переменных окружения)
-    HTTP_PROXY = os.getenv("HTTP_PROXY")
-    HTTPS_PROXY = os.getenv("HTTPS_PROXY")
+    # 🔥 ПРОКСИ ВСТАВЛЕН (можно заменить на другой из списка)
+    PROXY = "http://bjumcuxv:lodgiq7akwo7@31.59.20.176:6754"
 
     # OpenSky (анонимный доступ)
     OPENSKY_URL = "https://opensky-network.org/api/states/all"
@@ -42,7 +41,6 @@ class Config:
         "https://opendata.adsb.fi/api/v3/aircraft",
         "https://api.adsb.fi/api/v3/aircraft",
         "https://airplanes.live/v1/aircraft",
-        "https://public-api.adsbexchange.com/api/aircraft/HEX.json",  # требует ICAO, но используем как fallback
     ]
 
     # База данных ICAO
@@ -311,7 +309,7 @@ class AircraftDatabase:
     def get(self, icao: str) -> Optional[Dict[str, str]]:
         return self.data.get(icao.lower())
 
-# ---------- Основной трекер с поддержкой прокси ----------
+# ---------- Основной трекер ----------
 class AircraftTracker:
     def __init__(self, db: AircraftDatabase):
         self.db = db
@@ -319,9 +317,8 @@ class AircraftTracker:
         self.active_chats: set = set()
         self.chat_intervals: Dict[int, int] = {}
         self.fr24_api = FlightRadar24API() if FR24_API_AVAILABLE else None
-
-        # Настройка прокси для aiohttp
-        self.proxy = Config.HTTPS_PROXY or Config.HTTP_PROXY
+        self.proxy = Config.PROXY
+        logger.info(f"🔒 Прокси: {self.proxy if self.proxy else 'не используется'}")
 
     def get_interval(self, chat_id: int) -> int:
         return self.chat_intervals.get(chat_id, Config.DEFAULT_INTERVAL)
@@ -329,9 +326,9 @@ class AircraftTracker:
     def set_interval(self, chat_id: int, interval_seconds: int):
         self.chat_intervals[chat_id] = interval_seconds
 
-    # ---------- OpenSky (анонимный, с прокси и повторными попытками) ----------
+    # ---------- OpenSky (анонимный, с прокси) ----------
     async def fetch_opensky(self) -> List[Dict]:
-        for attempt in range(1, 5):  # 4 попытки
+        for attempt in range(1, 5):
             try:
                 connector = aiohttp.TCPConnector(family=socket.AF_INET)
                 timeout = aiohttp.ClientTimeout(total=90, connect=30)
@@ -408,15 +405,7 @@ class AircraftTracker:
                             text = await resp.text()
                             logger.error(f"ADS-B JSON ошибка: {e}, получено: {text[:200]}")
                             continue
-                        # Обработка разных форматов
-                        ac_list = []
-                        if 'ac' in data:
-                            ac_list = data['ac']
-                        elif 'aircraft' in data:
-                            ac_list = data['aircraft']
-                        else:
-                            logger.warning(f"Неизвестный формат от {url}")
-                            continue
+                        ac_list = data.get('ac', [])
                         if not ac_list:
                             continue
                         result = []
@@ -492,7 +481,6 @@ class AircraftTracker:
     # ---------- Мониторинг ----------
     async def monitor(self, context: ContextTypes.DEFAULT_TYPE):
         chat_id = context.job.chat_id
-        # Список источников с приоритетом
         sources = [
             ("OpenSky", self.fetch_opensky),
             ("ADS-B", self.fetch_adsb),

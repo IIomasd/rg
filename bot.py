@@ -391,7 +391,6 @@ class AircraftTracker:
                         text = await resp.text()
                         logger.error(f"ADS-B JSON ошибка: {e}, получено: {text[:200]}")
                         return []
-                    # Формат данных opendata.adsb.fi: {"ac": [...]}
                     ac_list = data.get('ac', [])
                     if not ac_list:
                         return []
@@ -581,7 +580,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Мульти-трекер*\n\n"
         "Использует источники:\n"
-        "- OpenSky (HTTP, анонимный доступ)\n"
+        "- OpenSky (HTTP, анонимный доступ, 3 попытки)\n"
         "- ADS-B Exchange (opendata.adsb.fi)\n"
         "- FlightRadarAPI (если установлена)\n\n"
         "Фильтрует по регионам:\n"

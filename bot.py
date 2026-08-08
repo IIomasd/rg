@@ -1,61 +1,33 @@
 import logging
+from datetime import datetime, timedelta
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+import aiohttp
 import csv
 import os
-import asyncio
-import re
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
-import aiohttp
 import requests
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from typing import Dict, List, Optional
 
 # -------------------- КОНФИГУРАЦИЯ --------------------
-class Config:
-    BOT_TOKEN = os.getenv("BOT_TOKEN")
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN не задан!")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не задан!")
 
-    FR24_URL = "https://data-cloud.flightradar24.com/zones/fcgi/feed.js"
-    FR24_PARAMS = {
-        "bounds": "90,-90,-180,180",
-        "faa": "1",
-        "satellite": "1",
-        "mlat": "1",
-        "flarm": "1",
-        "adsb": "1",
-        "gnd": "1",
-        "air": "1",
-        "vehicles": "1",
-        "estimated": "1",
-        "maxage": "7200",
-        "gliders": "1",
-        "stats": "1"
-    }
-    USER_AGENT = "MilitaryAircraftBot/1.0 (+https://example.com/bot)"
-    HEADERS = {
-        "User-Agent": USER_AGENT,
-        "Referer": "https://www.flightradar24.com/",
-        "Origin": "https://www.flightradar24.com",
-        "Accept": "application/json",
-    }
+USER_AGENT = "MilitaryAircraftBot/1.0 (+https://example.com/bot)"
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Referer": "https://www.flightradar24.com/",
+    "Origin": "https://www.flightradar24.com",
+    "Accept": "application/json",
+}
 
-    DATABASE_URL = "https://drive.google.com/uc?export=download&id=1sS8a5AZdiXMze8f08iNnVL7kTnlRuarl"
-    FALLBACK_DATABASE_URL = "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv"
-    LOCAL_DB_FILE = "aircraftDatabase.csv"
-    DEFAULT_INTERVAL = 30
-    MIN_INTERVAL = 15
-    DB_DOWNLOAD_TIMEOUT = 90
-    DB_RETRY_ATTEMPTS = 3
-    DB_RETRY_DELAY = 5
+TRACKED_AIRCRAFTS = {}
 
-# -------------------- СЛОВАРИ СТРАН И ТИПОВ ВС --------------------
+DEFAULT_INTERVAL = 30
+MIN_INTERVAL = 15
+chat_intervals: Dict[int, int] = {}
+
+# -------------------- ДАННЫЕ (из вашего кода) --------------------
 COUNTRY_CODES = {
     'A2': '🇧🇼 Ботсвана', 'A3': '🇹🇴 Тонга', 'A4': '🇴🇲 Оман', 'A5': '🇧🇹 Бутан',
     'A6': '🇦🇪 ОАЭ', 'A7': '🇶🇦 Катар', 'A8': '🇱🇷 Либерия', 'A9': '🇧🇭 Бахрейн',
@@ -165,24 +137,33 @@ AIRCRAFT_NAMES = {
     'KC130J': 'KC-130J'
 }
 
-# Целевые коды (поиск по вхождению)
-TARGET_CODES = {
-    'C130', 'KC130', 'MC130', 'C17', 'C5', 'C2',
-    'KC135', 'KC10', 'KC46', 'DC10', 'A400M',
-    'P1', 'CP140', 'F16', 'F15', 'F22', 'F35', 'F18',
-    'EA18G', 'B1', 'B2', 'B52', 'E3', 'E2', 'E8', 'E7',
-    'E4', 'E6', 'E767', 'P3', 'P8', 'U2', 'RC135',
-    'C30', 'K35R', 'R135', 'C30J', 'C5M'
+
+TARGET_TYPES = {
+    'exact': {
+        'C130', 'KC130', 'MC130', 'KC130J', 'C17', 'C5',
+        'C2', 'KC135', 'KC10', 'KC46', 'DC10', 'A400M',
+        'P1', 'CP140', 'F16', 'F15', 'F22', 'F35', 'F18',
+        'EA18G', 'B1', 'B2', 'B52', 'E3', 'E2', 'E8', 'E7',
+        'E4', 'E6', 'E767', 'P3', 'P8', 'U2', 'RC135', 'E2C',
+        'E2K', 'E737', 'C2A', 'K35R', 'R135', 'C30', 'C30J',
+        'C5M', 'E3TF'
+    },
+    'partial': {
+        'C17A', 'KC135R', 'KC135T', 'KC10A', 'KC46A',
+        'F16C', 'F15E', 'F22A', 'F35A', 'F35B', 'F35C',
+        'EA18G', 'B1B', 'B2A', 'B52', 'E3G', 'E2D', 'P8A', 'MC130',
+        'K35R', 'R135', 'C30', 'C30J', 'E3TF'
+    }
 }
 
-# -------------------- ЛОГИРОВАНИЕ --------------------
+# Настройка логгирования
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# -------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ --------------------
+# -------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (из вашего кода) --------------------
 def get_country_by_registration(registration: str) -> str:
     if not registration:
         return "🌍 Страна неизвестна"
@@ -193,8 +174,6 @@ def get_country_by_registration(registration: str) -> str:
     return "🌍 Страна неизвестна"
 
 def format_coordinates(lat: float, lon: float) -> str:
-    if lat is None or lon is None:
-        return "📍 Координаты недоступны"
     try:
         lat_dir = "С" if lat >= 0 else "Ю"
         lon_dir = "В" if lon >= 0 else "З"
@@ -202,279 +181,138 @@ def format_coordinates(lat: float, lon: float) -> str:
     except TypeError:
         return "📍 Координаты недоступны"
 
-def normalize_type(aircraft_type: str) -> str:
-    if not aircraft_type:
-        return ""
-    return re.sub(r'[^A-Z0-9]', '', aircraft_type.upper())
+def is_target_aircraft(aircraft: dict) -> bool:
+    aircraft_type = aircraft.get('type', '')
+    clean_type = aircraft_type.replace("-", "").replace(" ", "").replace("_", "").replace("GRND", "").replace("GND", "")
 
-def is_target_aircraft(aircraft_type: str) -> bool:
-    if not aircraft_type:
-        return False
-    clean = normalize_type(aircraft_type)
-    for code in TARGET_CODES:
-        if code in clean:
+    if clean_type in TARGET_TYPES['exact']:
+        return True
+    for part in TARGET_TYPES['partial']:
+        if part in clean_type:
             return True
     return False
 
-# -------------------- ЗАГРУЗЧИК БАЗЫ ДАННЫХ --------------------
-class AircraftDatabase:
-    def __init__(self):
-        self.data: Dict[str, Dict[str, str]] = {}
-        self._loaded = False
+# -------------------- ФУНКЦИИ РАБОТЫ С FR24 (из вашего кода) --------------------
+async def fetch_data(session, url, params):
+    try:
+        async with session.get(url, headers=HEADERS, params=params, timeout=15) as response:
+            logger.info(f"Запрос: {response.status} {response.url}")
+            response.raise_for_status()
+            return await response.json()
+    except Exception as e:
+        logger.error(f"Ошибка запроса: {str(e)}")
+        return None
 
-    def load_sync(self):
-        if self._loaded:
-            return
-        if not os.path.exists(Config.LOCAL_DB_FILE):
-            logger.info("Скачиваю базу данных с Google Drive...")
-            self._download_sync()
-        else:
-            logger.info("Загрузка базы из локального файла")
-        self._load_from_file()
-        self._loaded = True
-        logger.info(f"База загружена: {len(self.data)} записей")
+async def parse_fr24_data(json_data):
+    aircrafts = []
+    if not json_data:
+        return aircrafts
 
-    def _download_sync(self):
-        for attempt in range(1, Config.DB_RETRY_ATTEMPTS + 1):
-            try:
-                logger.info(f"Попытка {attempt} из {Config.DB_RETRY_ATTEMPTS} – скачивание с Google Drive")
-                response = requests.get(
-                    Config.DATABASE_URL,
-                    stream=True,
-                    timeout=Config.DB_DOWNLOAD_TIMEOUT,
-                    allow_redirects=True
-                )
-                if response.status_code == 200:
-                    with open(Config.LOCAL_DB_FILE, "wb") as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            if chunk:
-                                f.write(chunk)
-                    logger.info("База успешно скачана с Google Drive")
-                    return
-                else:
-                    logger.warning(f"Google Drive ответил {response.status_code}, пробую fallback...")
-                    break
-            except Exception as e:
-                logger.warning(f"Ошибка при скачивании с Google Drive (попытка {attempt}): {e}")
-                if attempt < Config.DB_RETRY_ATTEMPTS:
-                    import time
-                    time.sleep(Config.DB_RETRY_DELAY * attempt)
-                else:
-                    logger.info("Попытка скачать с оригинального OpenSky...")
-                    try:
-                        response = requests.get(
-                            Config.FALLBACK_DATABASE_URL,
-                            stream=True,
-                            timeout=Config.DB_DOWNLOAD_TIMEOUT,
-                            allow_redirects=True
-                        )
-                        if response.status_code == 200:
-                            with open(Config.LOCAL_DB_FILE, "wb") as f:
-                                for chunk in response.iter_content(chunk_size=8192):
-                                    if chunk:
-                                        f.write(chunk)
-                            logger.info("База скачана с OpenSky (fallback)")
-                            return
-                    except Exception as e2:
-                        logger.error(f"Ошибка fallback: {e2}")
+    try:
+        for aircraft_id, data in json_data.items():
+            if aircraft_id in ('full_count', 'version', 'stats'):
+                continue
 
-        logger.error("Не удалось скачать базу данных. Будет использована пустая база.")
-        with open(Config.LOCAL_DB_FILE, "w") as f:
-            f.write("icao24,registration,model\n")
-        self.data = {}
+            if isinstance(data, list) and len(data) > 18:
+                aircraft_type = (data[8] or '').strip().upper()
+                operator = (data[18] or '').strip().upper()
 
-    def _load_from_file(self):
-        try:
-            with open(Config.LOCAL_DB_FILE, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    icao = row.get("icao24", "").strip().lower()
-                    if not icao:
-                        continue
-                    registration = row.get("registration", "").strip()
-                    aircraft_type = row.get("model", "").strip()
-                    self.data[icao] = {
-                        "registration": registration if registration else "N/A",
-                        "type": aircraft_type if aircraft_type else "N/A"
-                    }
-        except Exception as e:
-            logger.error(f"Ошибка чтения базы: {e}")
-            self.data = {}
-
-    def get(self, icao: str) -> Optional[Dict[str, str]]:
-        return self.data.get(icao.lower())
-
-# -------------------- ОСНОВНОЙ ТРЕКЕР --------------------
-class AircraftTracker:
-    def __init__(self, db: AircraftDatabase):
-        self.db = db
-        self.tracked_aircrafts: Dict[str, Dict] = {}
-        self.active_chats: set = set()
-        self.chat_intervals: Dict[int, int] = {}
-
-    def get_interval(self, chat_id: int) -> int:
-        return self.chat_intervals.get(chat_id, Config.DEFAULT_INTERVAL)
-
-    def set_interval(self, chat_id: int, interval_seconds: int):
-        self.chat_intervals[chat_id] = interval_seconds
-
-    async def fetch_fr24(self, session: aiohttp.ClientSession):
-        try:
-            async with session.get(
-                Config.FR24_URL,
-                headers=Config.HEADERS,
-                params=Config.FR24_PARAMS,
-                timeout=30
-            ) as response:
-                logger.info(f"FR24 запрос: {response.status} {response.url}")
-                response.raise_for_status()
-                data = await response.json()
-                logger.info(f"FR24 ответ: {len(data)} записей, первые ключи: {list(data.keys())[:5]}")
-                return data
-        except Exception as e:
-            logger.error(f"Ошибка запроса к FR24: {e}")
-            return None
-
-    def parse_fr24_data(self, json_data: dict) -> List[Dict]:
-        aircrafts = []
-        if not json_data:
-            return aircrafts
-
-        total_entries = 0
-        parsed_entries = 0
-        try:
-            for aircraft_id, data in json_data.items():
-                total_entries += 1
-                if aircraft_id in ('full_count', 'version', 'stats'):
+                if aircraft_type in ('', 'GRND', 'GND'):
                     continue
 
-                if isinstance(data, list) and len(data) > 18:
-                    parsed_entries += 1
-                    aircraft_type = (data[8] or '').strip().upper()
-                    if aircraft_type in ('', 'GRND', 'GND'):
-                        continue
+                aircraft = {
+                    'icao': data[0] or 'N/A',
+                    'registration': (data[9] or '').strip(),
+                    'call_sign': (data[16] or '').strip(),
+                    'type': aircraft_type,
+                    'operator': operator,
+                    'lat': data[1] if len(data) > 1 else None,
+                    'lon': data[2] if len(data) > 2 else None,
+                    'timestamp': datetime.now()
+                }
 
-                    icao = data[0] or 'N/A'
-                    if icao == 'N/A':
-                        continue
-
-                    aircraft = {
-                        'icao': icao,
-                        'registration': (data[9] or '').strip(),
-                        'call_sign': (data[16] or '').strip(),
-                        'type': aircraft_type,
-                        'operator': (data[18] or '').strip(),
-                        'lat': data[1] if len(data) > 1 else None,
-                        'lon': data[2] if len(data) > 2 else None,
-                        'timestamp': datetime.now()
-                    }
+                if aircraft['icao'] != 'N/A' and aircraft['type']:
                     aircraft['country'] = get_country_by_registration(aircraft['registration'])
                     aircraft['coordinates'] = format_coordinates(aircraft['lat'], aircraft['lon'])
                     aircrafts.append(aircraft)
 
-        except Exception as e:
-            logger.error(f"Ошибка парсинга FR24: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"Ошибка парсинга: {str(e)}")
 
-        logger.info(f"Парсинг FR24: всего записей {total_entries}, обработано {parsed_entries}, самолётов {len(aircrafts)}")
-        return aircrafts
+    return aircrafts
 
-    async def monitor(self, context: ContextTypes.DEFAULT_TYPE):
-        chat_id = context.job.chat_id
+# -------------------- МОНИТОРИНГ --------------------
+async def monitor_aircrafts(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
 
-        try:
-            async with aiohttp.ClientSession(headers=Config.HEADERS) as session:
-                json_data = await self.fetch_fr24(session)
-                if not json_data:
-                    logger.warning("FR24: нет данных (пустой ответ)")
-                    return
+    url = "https://data-cloud.flightradar24.com/zones/fcgi/feed.js"
+    params = {
+        "bounds": "90,-90,-180,180",
+        "faa": "1",
+        "satellite": "1",
+        "mlat": "1",
+        "flarm": "1",
+        "adsb": "1",
+        "gnd": "1",
+        "air": "1",
+        "vehicles": "1",
+        "estimated": "1",
+        "maxage": "7200",
+        "gliders": "1",
+        "stats": "1"
+    }
 
-                aircrafts = self.parse_fr24_data(json_data)
-                logger.info(f"FR24: получено {len(aircrafts)} бортов")
+    try:
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
+            json_data = await fetch_data(session, url, params)
+            if not json_data:
+                return
 
-                if aircrafts:
-                    await self.process_aircrafts(aircrafts, chat_id, context)
-                else:
-                    logger.info("FR24: самолётов не найдено (после парсинга)")
+            aircrafts = await parse_fr24_data(json_data)
+            if not aircrafts:
+                logger.info("Нет данных о самолетах")
+                return
 
-        except Exception as e:
-            logger.error(f"Ошибка в мониторинге: {e}", exc_info=True)
+            new_detections = []
+            for aircraft in aircrafts:
+                if aircraft['icao'] not in TRACKED_AIRCRAFTS:
+                    if is_target_aircraft(aircraft):
+                        TRACKED_AIRCRAFTS[aircraft['icao']] = aircraft
 
-    async def process_aircrafts(self, aircrafts: List[Dict], chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> List[str]:
-        new_detections = []
+                        clean_type = aircraft['type'].replace("-", "").replace(" ", "").replace("_", "").replace("GRND", "").replace("GND", "")
+                        type_name = AIRCRAFT_NAMES.get(clean_type, aircraft['type'])
 
-        for aircraft in aircrafts:
-            icao = aircraft['icao']
-            if icao in self.tracked_aircrafts:
-                continue
+                        # Сообщение без оператора, высоты, скорости
+                        message = (
+                            "🚨 Самолет обнаружен!\n"
+                            f"🕒 Время: {aircraft['timestamp'].strftime('%d.%m.%Y %H:%M:%S')}\n"
+                            f"▫️ ICAO: {aircraft['icao']}\n"
+                            f"▫️ Регистрация: {aircraft['registration'] or 'N/A'}\n"
+                            f"▫️ Позывной: {aircraft['call_sign'] or 'N/A'}\n"
+                            f"▫️ Тип: {type_name}\n"
+                            f"▫️ Страна: {aircraft['country']}\n"
+                            f"▫️ Координаты: {aircraft['coordinates']}"
+                        )
 
-            db_entry = self.db.get(icao)
-            if db_entry:
-                aircraft_type = db_entry['type']
-                registration = db_entry['registration']
-            else:
-                aircraft_type = aircraft.get('type', 'N/A')
-                registration = aircraft.get('registration', 'N/A')
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=message,
+                            disable_web_page_preview=True
+                        )
+                        new_detections.append(aircraft['icao'])
 
-            if aircraft_type == 'N/A':
-                continue
+            if new_detections:
+                logger.info(f"Новых обнаружений: {len(new_detections)}")
 
-            if not is_target_aircraft(aircraft_type):
-                continue
+    except Exception as e:
+        logger.error(f"Ошибка мониторинга: {str(e)}", exc_info=True)
 
-            aircraft['type'] = aircraft_type
-            aircraft['registration'] = registration if registration != 'N/A' else aircraft.get('registration', 'N/A')
-            self.tracked_aircrafts[icao] = aircraft
+# -------------------- ОБРАБОТЧИКИ КОМАНД (с интервалом) --------------------
+def get_interval(chat_id: int) -> int:
+    return chat_intervals.get(chat_id, DEFAULT_INTERVAL)
 
-            clean_type = normalize_type(aircraft_type)
-            type_name = AIRCRAFT_NAMES.get(clean_type, aircraft_type)
-
-            message = (
-                "🚨 Самолет обнаружен!\n"
-                f"🕒 Время: {aircraft['timestamp'].strftime('%d.%m.%Y %H:%M:%S')}\n"
-                f"▫️ ICAO: {icao}\n"
-                f"▫️ Регистрация: {aircraft['registration'] or 'N/A'}\n"
-                f"▫️ Позывной: {aircraft['call_sign'] or 'N/A'}\n"
-                f"▫️ Тип: {type_name}\n"
-                f"▫️ Страна: {aircraft['country']}\n"
-                f"▫️ Координаты: {aircraft['coordinates']}"
-            )
-
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=message,
-                disable_web_page_preview=True
-            )
-            new_detections.append(icao)
-
-        if new_detections:
-            logger.info(f"Обнаружено {len(new_detections)} новых целей")
-        else:
-            logger.info("Новых целей не найдено")
-
-        return new_detections
-
-# -------------------- ОБРАБОТЧИКИ КОМАНД --------------------
-tracker = None
-
-def get_main_keyboard():
-    return ReplyKeyboardMarkup(
-        [
-            ["🟢 Запустить мониторинг", "🔴 Остановить"],
-            ["📊 Статус", "⚙️ Интервал"]
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="Выберите действие"
-    )
-
-def get_interval_keyboard():
-    options = [60, 300, 600, 1800, 3600]
-    buttons = []
-    for sec in options:
-        label = f"{sec // 60} мин"
-        buttons.append([KeyboardButton(label)])
-    buttons.append(["🔙 Назад"])
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True, is_persistent=True)
+def set_interval(chat_id: int, seconds: int):
+    chat_intervals[chat_id] = seconds
 
 async def _start_monitoring_for_chat(chat_id: int, context: ContextTypes.DEFAULT_TYPE, interval: Optional[int] = None):
     if context.job_queue is None:
@@ -483,62 +321,52 @@ async def _start_monitoring_for_chat(chat_id: int, context: ContextTypes.DEFAULT
     for job in jobs:
         job.schedule_removal()
     if interval is None:
-        interval = tracker.get_interval(chat_id)
+        interval = get_interval(chat_id)
     context.job_queue.run_repeating(
-        tracker.monitor,
+        monitor_aircrafts,
         interval=timedelta(seconds=interval),
         first=5,
         chat_id=chat_id,
-        name=str(chat_id),
-        job_kwargs={'max_instances': 1}
+        name=str(chat_id)
     )
-    tracker.active_chats.add(chat_id)
     return True
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+    keyboard = ReplyKeyboardMarkup(
+        [
+            ["🟢 Запустить мониторинг", "🔴 Остановить"],
+            ["📊 Статус", "⚙️ Интервал"]
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Выберите действие"
+    )
     await update.message.reply_text(
         "🛩 Авиационный трекер (Flightradar24)\n"
-        "Отслеживание самолётов по типам из списка.\n"
+        "Отслеживание самолётов по типам.\n"
         "Автоматически запускаю мониторинг...",
-        reply_markup=get_main_keyboard()
+        reply_markup=keyboard
     )
+    chat_id = update.effective_chat.id
     try:
         started = await _start_monitoring_for_chat(chat_id, context)
         if started:
-            interval = tracker.get_interval(chat_id)
+            interval = get_interval(chat_id)
             await update.message.reply_text(f"✅ Мониторинг активен (интервал: {interval} сек.)")
         else:
             await update.message.reply_text("⚠️ Мониторинг уже запущен.")
     except RuntimeError as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 *Авиационный трекер*\n\n"
-        "Бот отслеживает самолёты по данным Flightradar24.\n"
-        "Фильтрация по типу из списка целевых.\n"
-        "При обнаружении приходит уведомление.\n\n"
-        "*Команды:*\n"
-        "/start — запустить мониторинг\n"
-        "/help — справка\n"
-        "/status — статус\n"
-        "/stop — остановить\n"
-        "/setinterval <сек> — установить интервал (число секунд, минимум 15)",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
-    )
-
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    interval = tracker.get_interval(chat_id)
-    is_active = chat_id in tracker.active_chats
+    interval = get_interval(chat_id)
+    is_active = any(job.name == str(chat_id) for job in context.job_queue.jobs() if job.name)
     await update.message.reply_text(
-        f"🔍 Отслежено бортов: {len(tracker.tracked_aircrafts)}\n"
+        f"🔍 Отслежено бортов: {len(TRACKED_AIRCRAFTS)}\n"
         f"⏱ Интервал: {interval} сек.\n"
         f"🟢 Мониторинг: {'активен' if is_active else 'остановлен'}\n"
-        f"⏳ Последнее обновление: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
-        reply_markup=get_main_keyboard()
+        f"⏳ Последнее обновление: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
     )
 
 async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -546,7 +374,7 @@ async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         started = await _start_monitoring_for_chat(chat_id, context)
         if started:
-            interval = tracker.get_interval(chat_id)
+            interval = get_interval(chat_id)
             await update.message.reply_text(f"✅ Мониторинг запущен (интервал {interval} сек.).", reply_markup=get_main_keyboard())
         else:
             await update.message.reply_text("⚠️ Мониторинг уже активен.", reply_markup=get_main_keyboard())
@@ -564,14 +392,32 @@ async def stop_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     for job in jobs:
         job.schedule_removal()
-    tracker.active_chats.discard(chat_id)
-    if not tracker.active_chats:
-        tracker.tracked_aircrafts.clear()
+    TRACKED_AIRCRAFTS.clear()
     await update.message.reply_text("⛔ Мониторинг остановлен", reply_markup=get_main_keyboard())
+
+def get_main_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            ["🟢 Запустить мониторинг", "🔴 Остановить"],
+            ["📊 Статус", "⚙️ Интервал"]
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Выберите действие"
+    )
+
+def get_interval_keyboard():
+    options = [60, 300, 600, 1800, 3600]  # 1, 5, 10, 30, 60 минут
+    buttons = []
+    for sec in options:
+        label = f"{sec // 60} мин"
+        buttons.append([KeyboardButton(label)])
+    buttons.append(["🔙 Назад"])
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True, is_persistent=True)
 
 async def interval_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    current = tracker.get_interval(chat_id)
+    current = get_interval(chat_id)
     await update.message.reply_text(
         f"⚙️ *Настройка интервала опроса*\n\n"
         f"Текущий интервал: *{current} сек.*\n\n"
@@ -597,8 +443,8 @@ async def handle_interval_choice(update: Update, context: ContextTypes.DEFAULT_T
     }
     if text in interval_map:
         new_interval = interval_map[text]
-        tracker.set_interval(chat_id, new_interval)
-        if chat_id in tracker.active_chats:
+        set_interval(chat_id, new_interval)
+        if any(job.name == str(chat_id) for job in context.job_queue.jobs() if job.name):
             try:
                 await _start_monitoring_for_chat(chat_id, context, new_interval)
                 await update.message.reply_text(
@@ -622,11 +468,11 @@ async def set_interval_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     try:
         seconds = int(context.args[0])
-        if seconds < Config.MIN_INTERVAL:
-            await update.message.reply_text(f"Минимальный интервал – {Config.MIN_INTERVAL} секунд.")
+        if seconds < MIN_INTERVAL:
+            await update.message.reply_text(f"Минимальный интервал – {MIN_INTERVAL} секунд.")
             return
-        tracker.set_interval(chat_id, seconds)
-        if chat_id in tracker.active_chats:
+        set_interval(chat_id, seconds)
+        if any(job.name == str(chat_id) for job in context.job_queue.jobs() if job.name):
             await _start_monitoring_for_chat(chat_id, context, seconds)
             await update.message.reply_text(f"✅ Интервал изменён на {seconds} сек. Мониторинг перезапущен.", reply_markup=get_main_keyboard())
         else:
@@ -655,20 +501,12 @@ def run_health_server(port=8080):
 
 # -------------------- ЗАПУСК --------------------
 def main():
-    global tracker
-
     health_thread = threading.Thread(target=run_health_server, args=(8080,), daemon=True)
     health_thread.start()
 
-    db = AircraftDatabase()
-    db.load_sync()
-
-    tracker = AircraftTracker(db)
-
-    application = Application.builder().token(Config.BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("monitor", start_monitoring))
     application.add_handler(CommandHandler("stop", stop_monitoring))

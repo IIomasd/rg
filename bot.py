@@ -4,6 +4,7 @@ import os
 import asyncio
 import re
 import json
+import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 import requests
@@ -16,6 +17,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ---------- Импорт источников ----------
 try:
@@ -23,14 +25,21 @@ try:
     OPENSKY_AVAILABLE = True
 except ImportError:
     OPENSKY_AVAILABLE = False
-    logging.getLogger(__name__).warning("opensky-api не установлена")
+    print("opensky-api не установлена")
 
 try:
     from pyfr24 import FlightRadar24
     FR24_PY_AVAILABLE = True
 except ImportError:
     FR24_PY_AVAILABLE = False
-    logging.getLogger(__name__).warning("pyfr24 не установлена")
+    print("pyfr24 не установлена")
+
+try:
+    from FlightRadarAPI import FlightRadar24API
+    FR24_API_AVAILABLE = True
+except ImportError:
+    FR24_API_AVAILABLE = False
+    print("FlightRadarAPI не установлена")
 
 # ---------- Конфигурация ----------
 class Config:
@@ -38,20 +47,11 @@ class Config:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не задан!")
 
-    # Путь к файлу credentials.json для OpenSky OAuth2
     OPENSKY_CREDENTIALS = "credentials.json"
-
-    # Источники данных (порядок важен)
-    SOURCES = [
-        {"name": "OpenSky (OAuth2)", "type": "opensky_oauth"},
-        {"name": "ADS-B Exchange", "type": "adsb"},
-        {"name": "Flightradar24 (pyfr24)", "type": "fr24_py"},
-    ]
-
     DATABASE_URL = "https://drive.google.com/uc?export=download&id=1sS8a5AZdiXMze8f08iNnVL7kTnlRuarl"
     FALLBACK_DATABASE_URL = "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv"
     LOCAL_DB_FILE = "aircraftDatabase.csv"
-    DEFAULT_INTERVAL = 60  # секунд
+    DEFAULT_INTERVAL = 60
     MIN_INTERVAL = 15
     DB_DOWNLOAD_TIMEOUT = 90
     DB_RETRY_ATTEMPTS = 3
@@ -59,43 +59,145 @@ class Config:
 
 # ---------- Географические регионы ----------
 REGIONS = [
-    # Индийский океан
-    {"lat_min": -30, "lat_max": 30, "lon_min": 40, "lon_max": 120},
-    # Южно-Китайское море
-    {"lat_min": 0, "lat_max": 25, "lon_min": 100, "lon_max": 125},
-    # Восточно-Китайское море
-    {"lat_min": 22, "lat_max": 35, "lon_min": 120, "lon_max": 130},
-    # Филиппинское море
-    {"lat_min": 10, "lat_max": 30, "lon_min": 125, "lon_max": 140},
-    # Японское море
-    {"lat_min": 33, "lat_max": 50, "lon_min": 125, "lon_max": 140},
-    # Жёлтое море
-    {"lat_min": 32, "lat_max": 40, "lon_min": 119, "lon_max": 125},
-    # Берингово море
-    {"lat_min": 50, "lat_max": 66, "lon_min": -170, "lon_max": -160},
-    # Чукотское море
-    {"lat_min": 66, "lat_max": 75, "lon_min": -180, "lon_max": -160},
-    # Австралия (прибрежные воды)
-    {"lat_min": -40, "lat_max": -10, "lon_min": 110, "lon_max": 155},
-    # Тихий океан (западная часть)
-    {"lat_min": -60, "lat_max": 70, "lon_min": 130, "lon_max": 180},
-    {"lat_min": -60, "lat_max": 70, "lon_min": -180, "lon_max": -120},
+    {"lat_min": -30, "lat_max": 30, "lon_min": 40, "lon_max": 120},   # Индийский океан
+    {"lat_min": 0, "lat_max": 25, "lon_min": 100, "lon_max": 125},    # Южно-Китайское море
+    {"lat_min": 22, "lat_max": 35, "lon_min": 120, "lon_max": 130},   # Восточно-Китайское море
+    {"lat_min": 10, "lat_max": 30, "lon_min": 125, "lon_max": 140},   # Филиппинское море
+    {"lat_min": 33, "lat_max": 50, "lon_min": 125, "lon_max": 140},   # Японское море
+    {"lat_min": 32, "lat_max": 40, "lon_min": 119, "lon_max": 125},   # Жёлтое море
+    {"lat_min": 50, "lat_max": 66, "lon_min": -170, "lon_max": -160}, # Берингово море
+    {"lat_min": 66, "lat_max": 75, "lon_min": -180, "lon_max": -160}, # Чукотское море
+    {"lat_min": -40, "lat_max": -10, "lon_min": 110, "lon_max": 155}, # Австралия
+    {"lat_min": -60, "lat_max": 70, "lon_min": 130, "lon_max": 180},  # Тихий океан (запад)
+    {"lat_min": -60, "lat_max": 70, "lon_min": -180, "lon_max": -120},# Тихий океан (восток)
 ]
 
 def is_in_region(lat: float, lon: float) -> bool:
-    """Проверяет, находится ли точка в одном из заданных регионов."""
     if lat is None or lon is None:
         return False
-    for region in REGIONS:
-        if (region["lat_min"] <= lat <= region["lat_max"] and
-            region["lon_min"] <= lon <= region["lon_max"]):
+    for r in REGIONS:
+        if r["lat_min"] <= lat <= r["lat_max"] and r["lon_min"] <= lon <= r["lon_max"]:
             return True
     return False
 
-# ---------- Словари (полные, как в предыдущих версиях) ----------
-COUNTRY_CODES = { ... }  # Вставьте полный словарь
-AIRCRAFT_NAMES = { ... } # Вставьте полный словарь
-TARGET_CODES = { ... }   # Вставьте набор целевых кодов
+# ---------- Словари стран, типов, целей ----------
+COUNTRY_CODES = {
+    'A2': '🇧🇼 Ботсвана', 'A3': '🇹🇴 Тонга', 'A4': '🇴🇲 Оман', 'A5': '🇧🇹 Бутан',
+    'A6': '🇦🇪 ОАЭ', 'A7': '🇶🇦 Катар', 'A8': '🇱🇷 Либерия', 'A9': '🇧🇭 Бахрейн',
+    'AP': '🇵🇰 Пакистан', 'B': '🇨🇳 Китай', 'C': '🇨🇦 Канада', 'CC': '🇨🇱 Чили',
+    'CD': '🇨🇩 ДР Конго', 'CR': '🇨🇷 Коста-Рика', 'CU': '🇨🇺 Куба', 'CX': '🇺🇾 Уругвай',
+    'D': '🇩🇪 Германия', 'DQ': '🇫🇯 Фиджи', 'DR': '🇳🇪 Нигер', 'EC': '🇪🇨 Эквадор',
+    'EI': '🇮🇪 Ирландия', 'EK': '🇩🇰 Дания', 'EL': '🇱🇷 Либерия', 'EP': '🇮🇷 Иран',
+    'ER': '🇲🇩 Молдова', 'ES': '🇪🇪 Эстония', 'ET': '🇩🇪 Германия (военные)',
+    'EW': '🇬🇪 Грузия', 'EX': '🇰🇬 Кыргызстан', 'EY': '🇹🇯 Таджикистан', 'F': '🇫🇷 Франция',
+    'G': '🇬🇧 Великобритания', 'H4': '🇸🇧 Соломоновы Острова', 'HA': '🇭🇺 Венгрия',
+    'HB': '🇱🇮 Лихтенштейн', 'HL': '🇰🇷 Южная Корея', 'HP': '🇵🇦 Панама', 'HR': '🇭🇳 Гондурас',
+    'HS': '🇹🇭 Таиланд', 'HU': '🇸🇻 Сальвадор', 'I': '🇮🇹 Италия', 'J': '🇯🇵 Япония',
+    'JA': '🇯🇵 Япония', 'JY': '🇯🇴 Иордания', 'LN': '🇳🇴 Норвегия', 'LV': '🇦🇷 Аргентина',
+    'LZ': '🇧🇬 Болгария', 'N': '🇺🇸 США', 'OB': '🇵🇪 Перу', 'OD': '🇱🇧 Ливан',
+    'OE': '🇸🇦 Саудовская Аравия', 'OH': '🇫🇮 Финляндия', 'OK': '🇨🇿 Чехия',
+    'OM': '🇸🇰 Словакия', 'OO': '🇧🇪 Бельгия', 'OY': '🇩🇰 Дания', 'P': '🇰🇵 Северная Корея',
+    'PH': '🇳🇱 Нидерланды', 'PT': '🇧🇷 Бразилия', 'RA': '🇷🇺 Россия', 'RDPL': '🇱🇦 Лаос',
+    'RP': '🇵🇭 Филиппины', 'SE': '🇸🇪 Швеция', 'SP': '🇵🇱 Польша', 'ST': '🇸🇩 Судан',
+    'SU': '🇪🇬 Египет', 'SX': '🇬🇷 Греция', 'T7': '🇸🇲 Сан-Марино', 'TC': '🇹🇷 Турция',
+    'TF': '🇮🇸 Исландия', 'TG': '🇬🇹 Гватемала', 'TI': '🇨🇷 Коста-Рика', 'TJ': '🇨🇲 Камерун',
+    'TL': '🇨🇫 ЦАР', 'TR': '🇬🇦 Габон', 'TS': '🇹🇳 Тунис', 'TT': '🇨🇭 Швейцария',
+    'TU': '🇨🇮 Кот-д\'Ивуар', 'TY': '🇧🇯 Бенин', 'TZ': '🇲🇱 Мали', 'UR': '🇺🇦 Украина',
+    'V2': '🇦🇬 Антигуа и Барбуда', 'V3': '🇧🇿 Белиз', 'V4': '🇰🇳 Сент-Китс и Невис',
+    'V5': '🇳🇦 Намибия', 'V6': '🇫🇲 Микронезия', 'V7': '🇲🇭 Маршалловы Острова',
+    'V8': '🇧🇳 Бруней', 'XA': '🇲🇽 Мексика', 'XT': '🇧🇫 Буркина-Фасо', 'XY': '🇲🇲 Мьянма',
+    'XZ': '🇲🇳 Монголия', 'YA': '🇦🇫 Афганистан', 'YI': '🇮🇶 Ирак', 'YJ': '🇻🇺 Вануату',
+    'YK': '🇸🇾 Сирия', 'YL': '🇱🇻 Латвия', 'YN': '🇳🇮 Никарагуа', 'YR': '🇷🇴 Румыния',
+    'YS': '🇸🇻 Сальвадор', 'YU': '🇷🇸 Сербия', 'YV': '🇻🇪 Венесуэла', 'Z': '🇿🇦 ЮАР',
+    'ZA': '🇦🇱 Албания', 'ZK': '🇳🇿 Новая Зеландия', 'ZP': '🇵🇾 Парагвай', 'ZS': '🇿🇦 ЮАР',
+    'ZT': '🇿🇲 Замбия', 'ZU': '🇿🇼 Зимбабве', '3B': '🇲🇺 Маврикий', '3C': '🇬🇶 Экв. Гвинея',
+    '3D': '🇸🇿 Эсватини', '3X': '🇬🇳 Гвинея', '4K': '🇦🇿 Азербайджан', '4R': '🇱🇰 Шри-Ланка',
+    '4X': '🇮🇱 Израиль', '5A': '🇱🇾 Ливия', '5B': '🇨🇾 Кипр', '5H': '🇹🇿 Танзания',
+    '5N': '🇳🇬 Нигерия', '5R': '🇲🇬 Мадагаскар', '5T': '🇲🇷 Мавритания', '5U': '🇳🇪 Нигер',
+    '5V': '🇹🇬 Того', '5X': '🇺🇬 Уганда', '6O': '🇸🇴 Сомали', '6V': '🇸🇳 Сенегал',
+    '6W': '🇸🇸 Южный Судан', '7O': '🇾🇪 Йемен', '7P': '🇱🇸 Лесото', '7Q': '🇲🇼 Малави',
+    '7T': '🇩🇿 Алжир', '8P': '🇧🇧 Барбадос', '8Q': '🇲🇻 Мальдивы', '8R': '🇬🇾 Гайана',
+    '9A': '🇭🇷 Хорватия', '9G': '🇬🇭 Гана', '9H': '🇲🇹 Мальта', '9J': '🇿🇲 Замбия',
+    '9K': '🇰🇼 Кувейт', '9L': '🇸🇱 Сьерра-Леоне', '9M': '🇲🇾 Малайзия', '9N': '🇳🇵 Непал',
+    '9Q': '🇨🇩 ДР Конго', '9U': '🇧🇮 Бурунди', '9V': '🇸🇬 Сингапур', '9XR': '🇷🇼 Руанда',
+    'C2': '🇳🇷 Науру', 'D2': '🇦🇴 Ангола', 'D4': '🇨🇻 Кабо-Верде', 'E3': '🇪🇷 Эритрея',
+    'E5': '🇨🇰 Острова Кука', 'HZ': '🇸🇦 Саудовская Аравия', 'J2': '🇩🇯 Джибути',
+    'J3': '🇬🇩 Гренада', 'S7': '🇸🇨 Сейшелы', 'T9': '🇧🇦 Босния и Герцеговина',
+    'UP': '🇰🇿 Казахстан', 'VH': '🇦🇺 Австралия', 'VP-B': '🇧🇲 Бермуды',
+    'VP-L': '🇲🇴 Макао', 'VQ-H': '🇬🇬 Гернси', 'VQ-T': '🇹🇨 Теркс и Кайкос',
+    'Z3': '🇲🇰 Северная Македония'
+}
+
+AIRCRAFT_NAMES = {
+    'B52': 'B-52 Stratofortress',
+    'C17': 'C-17 Globemaster III',
+    'F16': 'F-16 Fighting Falcon',
+    'F35': 'F-35 Lightning II',
+    'KC135': 'KC-135 Stratotanker',
+    'KC10': 'KC-10 Extender',
+    'E3': 'E-3 Sentry',
+    'U2': 'U-2 Dragon Lady',
+    'RC135': 'RC-135 Rivet Joint',
+    'C130': 'C-130 Hercules',
+    'A400M': 'A400M Atlas',
+    'P8': 'P-8 Poseidon',
+    'C5': 'C-5 Galaxy',
+    'C2': 'C-2 Greyhound',
+    'KC46': 'KC-46 Pegasus',
+    'DC10': 'DC-10',
+    'P1': 'P-1',
+    'CP140': 'CP-140 Aurora',
+    'F15': 'F-15 Eagle',
+    'F22': 'F-22 Raptor',
+    'F18': 'F/A-18 Hornet',
+    'EA18G': 'EA-18G Growler',
+    'B1': 'B-1 Lancer',
+    'B2': 'B-2 Spirit',
+    'E2': 'E-2 Hawkeye',
+    'E7': 'E-7 Wedgetail',
+    'E4': 'E-4 Nightwatch',
+    'E6': 'E-6 Mercury',
+    'E767': 'E-767',
+    'P3': 'P-3 Orion',
+    'E2C': 'E-2C Hawkeye',
+    'E2K': 'E-2K Hawkeye',
+    'E737': 'E-737 Wedgetail',
+    'C2A': 'C-2A Greyhound',
+    'K35R': 'KC-135R Stratotanker',
+    'R135': 'RC-135',
+    'C30': 'C-30',
+    'C30J': 'C-30J',
+    'C5M': 'C-5M Super Galaxy',
+    'E3TF': 'E-3 Sentry (Турция)',
+    'C17A': 'C-17A Globemaster III',
+    'KC135R': 'KC-135R Stratotanker',
+    'KC135T': 'KC-135T Stratotanker',
+    'KC10A': 'KC-10A Extender',
+    'KC46A': 'KC-46A Pegasus',
+    'F16C': 'F-16C Fighting Falcon',
+    'F15E': 'F-15E Strike Eagle',
+    'F22A': 'F-22A Raptor',
+    'F35A': 'F-35A Lightning II',
+    'F35B': 'F-35B Lightning II',
+    'F35C': 'F-35C Lightning II',
+    'B1B': 'B-1B Lancer',
+    'B2A': 'B-2A Spirit',
+    'E3G': 'E-3G Sentry',
+    'E2D': 'E-2D Advanced Hawkeye',
+    'P8A': 'P-8A Poseidon',
+    'MC130': 'MC-130',
+    'KC130': 'KC-130',
+    'KC130J': 'KC-130J'
+}
+
+TARGET_CODES = {
+    'C130', 'KC130', 'MC130', 'C17', 'C5', 'C2',
+    'KC135', 'KC10', 'KC46', 'DC10', 'A400M',
+    'P1', 'CP140', 'F16', 'F15', 'F22', 'F35', 'F18',
+    'EA18G', 'B1', 'B2', 'B52', 'E3', 'E2', 'E8', 'E7',
+    'E4', 'E6', 'E767', 'P3', 'P8', 'U2', 'RC135',
+    'C30', 'K35R', 'R135', 'C30J', 'C5M'
+}
 
 # ---------- Логирование ----------
 logging.basicConfig(
@@ -108,8 +210,7 @@ logger = logging.getLogger(__name__)
 def get_country_by_registration(registration: str) -> str:
     if not registration:
         return "🌍 Страна неизвестна"
-    sorted_prefixes = sorted(COUNTRY_CODES.keys(), key=len, reverse=True)
-    for prefix in sorted_prefixes:
+    for prefix in sorted(COUNTRY_CODES.keys(), key=len, reverse=True):
         if registration.startswith(prefix):
             return COUNTRY_CODES[prefix]
     return "🌍 Страна неизвестна"
@@ -117,28 +218,25 @@ def get_country_by_registration(registration: str) -> str:
 def format_coordinates(lat: float, lon: float) -> str:
     if lat is None or lon is None:
         return "📍 Координаты недоступны"
-    try:
-        lat_dir = "С" if lat >= 0 else "Ю"
-        lon_dir = "В" if lon >= 0 else "З"
-        return f"{abs(lat):.2f}°{lat_dir}, {abs(lon):.2f}°{lon_dir}"
-    except TypeError:
-        return "📍 Координаты недоступны"
+    lat_dir = "С" if lat >= 0 else "Ю"
+    lon_dir = "В" if lon >= 0 else "З"
+    return f"{abs(lat):.2f}°{lat_dir}, {abs(lon):.2f}°{lon_dir}"
 
-def normalize_type(aircraft_type: str) -> str:
-    if not aircraft_type:
+def normalize_type(t: str) -> str:
+    if not t:
         return ""
-    return re.sub(r'[^A-Z0-9]', '', aircraft_type.upper())
+    return re.sub(r'[^A-Z0-9]', '', t.upper())
 
-def is_target_aircraft(aircraft_type: str) -> bool:
-    if not aircraft_type:
+def is_target(t: str) -> bool:
+    if not t:
         return False
-    clean = normalize_type(aircraft_type)
+    clean = normalize_type(t)
     for code in TARGET_CODES:
         if code in clean:
             return True
     return False
 
-# ---------- Загрузчик базы данных ICAO ----------
+# ---------- Загрузчик базы ICAO ----------
 class AircraftDatabase:
     def __init__(self):
         self.data: Dict[str, Dict[str, str]] = {}
@@ -160,21 +258,16 @@ class AircraftDatabase:
         for attempt in range(1, Config.DB_RETRY_ATTEMPTS + 1):
             try:
                 logger.info(f"Попытка {attempt} из {Config.DB_RETRY_ATTEMPTS} – скачивание с Google Drive")
-                response = requests.get(
-                    Config.DATABASE_URL,
-                    stream=True,
-                    timeout=Config.DB_DOWNLOAD_TIMEOUT,
-                    allow_redirects=True
-                )
-                if response.status_code == 200:
+                resp = requests.get(Config.DATABASE_URL, stream=True, timeout=Config.DB_DOWNLOAD_TIMEOUT, allow_redirects=True)
+                if resp.status_code == 200:
                     with open(Config.LOCAL_DB_FILE, "wb") as f:
-                        for chunk in response.iter_content(chunk_size=8192):
+                        for chunk in resp.iter_content(chunk_size=8192):
                             if chunk:
                                 f.write(chunk)
                     logger.info("База успешно скачана с Google Drive")
                     return
                 else:
-                    logger.warning(f"Google Drive ответил {response.status_code}, пробую fallback...")
+                    logger.warning(f"Google Drive ответил {resp.status_code}, пробую fallback...")
                     break
             except Exception as e:
                 logger.warning(f"Ошибка при скачивании с Google Drive (попытка {attempt}): {e}")
@@ -184,22 +277,16 @@ class AircraftDatabase:
                 else:
                     logger.info("Попытка скачать с оригинального OpenSky...")
                     try:
-                        response = requests.get(
-                            Config.FALLBACK_DATABASE_URL,
-                            stream=True,
-                            timeout=Config.DB_DOWNLOAD_TIMEOUT,
-                            allow_redirects=True
-                        )
-                        if response.status_code == 200:
+                        resp = requests.get(Config.FALLBACK_DATABASE_URL, stream=True, timeout=Config.DB_DOWNLOAD_TIMEOUT, allow_redirects=True)
+                        if resp.status_code == 200:
                             with open(Config.LOCAL_DB_FILE, "wb") as f:
-                                for chunk in response.iter_content(chunk_size=8192):
+                                for chunk in resp.iter_content(chunk_size=8192):
                                     if chunk:
                                         f.write(chunk)
                             logger.info("База скачана с OpenSky (fallback)")
                             return
                     except Exception as e2:
                         logger.error(f"Ошибка fallback: {e2}")
-
         logger.error("Не удалось скачать базу данных. Будет использована пустая база.")
         with open(Config.LOCAL_DB_FILE, "w") as f:
             f.write("icao24,registration,model\n")
@@ -213,11 +300,11 @@ class AircraftDatabase:
                     icao = row.get("icao24", "").strip().lower()
                     if not icao:
                         continue
-                    registration = row.get("registration", "").strip()
-                    aircraft_type = row.get("model", "").strip()
+                    reg = row.get("registration", "").strip()
+                    typ = row.get("model", "").strip()
                     self.data[icao] = {
-                        "registration": registration if registration else "N/A",
-                        "type": aircraft_type if aircraft_type else "N/A"
+                        "registration": reg if reg else "N/A",
+                        "type": typ if typ else "N/A"
                     }
         except Exception as e:
             logger.error(f"Ошибка чтения базы: {e}")
@@ -230,30 +317,48 @@ class AircraftDatabase:
 class AircraftTracker:
     def __init__(self, db: AircraftDatabase):
         self.db = db
-        self.tracked_aircrafts: Dict[str, Dict] = {}
+        self.tracked: Dict[str, Dict] = {}
         self.active_chats: set = set()
         self.chat_intervals: Dict[int, int] = {}
 
-        # Инициализация OpenSky (OAuth2)
+        # OpenSky OAuth2
         self.opensky_api = None
         if OPENSKY_AVAILABLE and os.path.exists(Config.OPENSKY_CREDENTIALS):
             try:
-                token_manager = TokenManager.from_json_file(Config.OPENSKY_CREDENTIALS)
-                self.opensky_api = OpenSkyApi(token_manager=token_manager)
+                tm = TokenManager.from_json_file(Config.OPENSKY_CREDENTIALS)
+                self.opensky_api = OpenSkyApi(token_manager=tm)
                 logger.info("OpenSky OAuth2 инициализирован")
             except Exception as e:
                 logger.error(f"Ошибка инициализации OpenSky OAuth2: {e}")
-        else:
-            logger.warning("OpenSky OAuth2 не доступен (нет credentials.json или библиотеки)")
 
-        # Инициализация pyfr24 (если установлена)
-        self.fr24_client = None
+        # pyfr24
+        self.fr24_py = None
         if FR24_PY_AVAILABLE:
             try:
-                self.fr24_client = FlightRadar24()
+                self.fr24_py = FlightRadar24()
                 logger.info("pyfr24 инициализирован")
             except Exception as e:
                 logger.error(f"Ошибка инициализации pyfr24: {e}")
+
+        # FlightRadarAPI
+        self.fr24_api = None
+        if FR24_API_AVAILABLE:
+            try:
+                self.fr24_api = FlightRadar24API()
+                logger.info("FlightRadarAPI инициализирован")
+            except Exception as e:
+                logger.error(f"Ошибка инициализации FlightRadarAPI: {e}")
+
+        # Список источников для опроса
+        self.sources = []
+        if self.opensky_api:
+            self.sources.append(("OpenSky OAuth2", self.fetch_opensky))
+        if self.fr24_py:
+            self.sources.append(("pyfr24", self.fetch_fr24_py))
+        if self.fr24_api:
+            self.sources.append(("FlightRadarAPI", self.fetch_fr24_api))
+        # ADS-B Exchange всегда доступен
+        self.sources.append(("ADS-B Exchange", self.fetch_adsb))
 
     def get_interval(self, chat_id: int) -> int:
         return self.chat_intervals.get(chat_id, Config.DEFAULT_INTERVAL)
@@ -261,34 +366,27 @@ class AircraftTracker:
     def set_interval(self, chat_id: int, interval_seconds: int):
         self.chat_intervals[chat_id] = interval_seconds
 
-    # ---------- OpenSky (OAuth2) ----------
-    async def fetch_opensky_oauth(self) -> List[Dict]:
+    # ---------- Источники данных ----------
+    async def fetch_opensky(self) -> List[Dict]:
         if not self.opensky_api:
             return []
         try:
-            logger.info("🔄 OpenSky (OAuth2): запрос...")
-            # Запрос всех состояний (можно добавить bounds для оптимизации)
+            logger.info("🔄 OpenSky OAuth2: запрос...")
             states = await asyncio.to_thread(self.opensky_api.get_states)
             if not states or not states.states:
-                logger.info("OpenSky OAuth2: пустой ответ")
                 return []
-            aircrafts = []
+            result = []
             for s in states.states:
-                icao = s.icao24.upper()
-                if not icao:
-                    continue
-                # Пропускаем наземные
                 if s.on_ground:
                     continue
-                lat = s.latitude
-                lon = s.longitude
+                lat, lon = s.latitude, s.longitude
                 if not is_in_region(lat, lon):
                     continue
-                aircraft = {
-                    'icao': icao,
-                    'registration': 'N/A',  # OpenSky не даёт регистрацию
+                result.append({
+                    'icao': s.icao24.upper(),
+                    'registration': 'N/A',
                     'call_sign': s.callsign.strip() if s.callsign else 'N/A',
-                    'type': 'N/A',  # OpenSky не даёт тип
+                    'type': 'N/A',
                     'operator': 'N/A',
                     'lat': lat,
                     'lon': lon,
@@ -297,15 +395,13 @@ class AircraftTracker:
                     'timestamp': datetime.now(),
                     'country': s.origin_country or 'Неизвестно',
                     'coordinates': format_coordinates(lat, lon)
-                }
-                aircrafts.append(aircraft)
-            logger.info(f"OpenSky OAuth2: получено {len(aircrafts)} бортов в регионе")
-            return aircrafts
+                })
+            logger.info(f"OpenSky OAuth2: {len(result)} бортов в регионе")
+            return result
         except Exception as e:
-            logger.error(f"Ошибка OpenSky OAuth2: {e}")
+            logger.error(f"OpenSky OAuth2 ошибка: {e}")
             return []
 
-    # ---------- ADS-B Exchange ----------
     async def fetch_adsb(self) -> List[Dict]:
         try:
             url = "https://data.adsbexchange.com/aircraft.json"
@@ -316,34 +412,30 @@ class AircraftTracker:
             }
             logger.info("🔄 ADS-B Exchange: запрос...")
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, timeout=20) as response:
-                    if response.status != 200:
-                        logger.warning(f"ADS-B Exchange: статус {response.status}")
+                async with session.get(url, headers=headers, timeout=20) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"ADS-B статус {resp.status}")
                         return []
                     try:
-                        json_data = await response.json(content_type=None)
-                    except Exception as json_err:
-                        text = await response.text()
-                        logger.error(f"ADS-B Exchange: ошибка JSON: {json_err}, получено: {text[:200]}...")
+                        data = await resp.json(content_type=None)
+                    except Exception as e:
+                        text = await resp.text()
+                        logger.error(f"ADS-B JSON ошибка: {e}, получено: {text[:200]}")
                         return []
-                    ac_list = json_data.get('ac', [])
+                    ac_list = data.get('ac', [])
                     if not ac_list:
-                        logger.info("ADS-B Exchange: пустой список")
                         return []
-                    aircrafts = []
+                    result = []
                     for ac in ac_list:
-                        if not isinstance(ac, dict):
+                        if ac.get('gnd'):
                             continue
                         icao = ac.get('hex', '').upper()
                         if not icao:
                             continue
-                        if ac.get('gnd', False):
-                            continue
-                        lat = ac.get('lat')
-                        lon = ac.get('lon')
+                        lat, lon = ac.get('lat'), ac.get('lon')
                         if not is_in_region(lat, lon):
                             continue
-                        aircraft = {
+                        result.append({
                             'icao': icao,
                             'registration': ac.get('r', '').strip() or 'N/A',
                             'call_sign': ac.get('flight', '').strip() or 'N/A',
@@ -356,136 +448,137 @@ class AircraftTracker:
                             'timestamp': datetime.now(),
                             'country': get_country_by_registration(ac.get('r', '')),
                             'coordinates': format_coordinates(lat, lon)
-                        }
-                        aircrafts.append(aircraft)
-                    logger.info(f"ADS-B Exchange: получено {len(aircrafts)} бортов в регионе")
-                    return aircrafts
+                        })
+                    logger.info(f"ADS-B: {len(result)} бортов в регионе")
+                    return result
         except Exception as e:
-            logger.error(f"Ошибка ADS-B Exchange: {e}")
+            logger.error(f"ADS-B ошибка: {e}")
             return []
 
-    # ---------- Flightradar24 (pyfr24) ----------
     async def fetch_fr24_py(self) -> List[Dict]:
-        if not self.fr24_client:
+        if not self.fr24_py:
             return []
         try:
-            logger.info("🔄 Flightradar24 (pyfr24): запрос...")
-            # Получаем все рейсы (это может быть медленно, поэтому используем asyncio.to_thread)
-            flights = await asyncio.to_thread(self.fr24_client.get_flights)
+            logger.info("🔄 pyfr24: запрос...")
+            flights = await asyncio.to_thread(self.fr24_py.get_flights)
             if not flights:
-                logger.info("pyfr24: пустой ответ")
                 return []
-            aircrafts = []
-            for flight in flights:
-                # pyfr24 возвращает объекты Flight
-                icao = getattr(flight, 'id', '').upper()
+            result = []
+            for f in flights:
+                icao = getattr(f, 'id', '').upper()
                 if not icao:
                     continue
-                lat = getattr(flight, 'latitude', None)
-                lon = getattr(flight, 'longitude', None)
+                lat, lon = getattr(f, 'latitude', None), getattr(f, 'longitude', None)
                 if not is_in_region(lat, lon):
                     continue
-                aircraft = {
+                result.append({
                     'icao': icao,
-                    'registration': getattr(flight, 'registration', 'N/A') or 'N/A',
-                    'call_sign': getattr(flight, 'callsign', 'N/A') or 'N/A',
-                    'type': getattr(flight, 'type', 'N/A') or 'N/A',
-                    'operator': getattr(flight, 'operator', 'N/A') or 'N/A',
+                    'registration': getattr(f, 'registration', 'N/A') or 'N/A',
+                    'call_sign': getattr(f, 'callsign', 'N/A') or 'N/A',
+                    'type': getattr(f, 'type', 'N/A') or 'N/A',
+                    'operator': getattr(f, 'operator', 'N/A') or 'N/A',
                     'lat': lat,
                     'lon': lon,
-                    'altitude': getattr(flight, 'altitude', None),
-                    'speed': getattr(flight, 'speed', None),
+                    'altitude': getattr(f, 'altitude', None),
+                    'speed': getattr(f, 'speed', None),
                     'timestamp': datetime.now(),
-                    'country': getattr(flight, 'origin_country', 'Неизвестно') or 'Неизвестно',
+                    'country': getattr(f, 'origin_country', 'Неизвестно') or 'Неизвестно',
                     'coordinates': format_coordinates(lat, lon)
-                }
-                aircrafts.append(aircraft)
-            logger.info(f"pyfr24: получено {len(aircrafts)} бортов в регионе")
-            return aircrafts
+                })
+            logger.info(f"pyfr24: {len(result)} бортов в регионе")
+            return result
         except Exception as e:
-            logger.error(f"Ошибка pyfr24: {e}")
+            logger.error(f"pyfr24 ошибка: {e}")
             return []
 
-    # ---------- Основной мониторинг ----------
+    async def fetch_fr24_api(self) -> List[Dict]:
+        if not self.fr24_api:
+            return []
+        try:
+            logger.info("🔄 FlightRadarAPI: запрос...")
+            flights = await asyncio.to_thread(self.fr24_api.get_flights)
+            if not flights:
+                return []
+            result = []
+            for f in flights:
+                icao = getattr(f, 'id', '').upper()
+                if not icao:
+                    continue
+                lat, lon = getattr(f, 'latitude', None), getattr(f, 'longitude', None)
+                if not is_in_region(lat, lon):
+                    continue
+                result.append({
+                    'icao': icao,
+                    'registration': getattr(f, 'registration', 'N/A') or 'N/A',
+                    'call_sign': getattr(f, 'callsign', 'N/A') or 'N/A',
+                    'type': getattr(f, 'type', 'N/A') or 'N/A',
+                    'operator': getattr(f, 'operator', 'N/A') or 'N/A',
+                    'lat': lat,
+                    'lon': lon,
+                    'altitude': getattr(f, 'altitude', None),
+                    'speed': getattr(f, 'speed', None),
+                    'timestamp': datetime.now(),
+                    'country': getattr(f, 'origin_country', 'Неизвестно') or 'Неизвестно',
+                    'coordinates': format_coordinates(lat, lon)
+                })
+            logger.info(f"FlightRadarAPI: {len(result)} бортов в регионе")
+            return result
+        except Exception as e:
+            logger.error(f"FlightRadarAPI ошибка: {e}")
+            return []
+
+    # ---------- Мониторинг ----------
     async def monitor(self, context: ContextTypes.DEFAULT_TYPE):
         chat_id = context.job.chat_id
-        aircrafts = []
-
-        for source in Config.SOURCES:
-            if source["type"] == "opensky_oauth":
-                aircrafts = await self.fetch_opensky_oauth()
-            elif source["type"] == "adsb":
-                aircrafts = await self.fetch_adsb()
-            elif source["type"] == "fr24_py":
-                aircrafts = await self.fetch_fr24_py()
-            else:
+        for name, fetcher in self.sources:
+            try:
+                aircrafts = await fetcher()
+            except Exception as e:
+                logger.error(f"Ошибка в источнике {name}: {e}")
                 continue
-
             if aircrafts:
-                logger.info(f"✅ Использован источник: {source['name']}, получено {len(aircrafts)} бортов")
-                await self.process_aircrafts(aircrafts, chat_id, context)
+                logger.info(f"✅ Использован источник: {name}, получено {len(aircrafts)}")
+                await self.process(aircrafts, chat_id, context)
                 return
             else:
-                logger.info(f"❌ Источник {source['name']} не вернул данные, пробуем следующий...")
+                logger.info(f"❌ Источник {name} не вернул данные, пробуем следующий...")
+        logger.info("❌ Все источники не дали данных в регионе")
 
-        logger.info("❌ Все источники данных не вернули самолёты в заданном регионе")
-
-    async def process_aircrafts(self, aircrafts: List[Dict], chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> List[str]:
-        new_detections = []
-
-        for aircraft in aircrafts:
-            icao = aircraft['icao']
-            if icao in self.tracked_aircrafts:
+    async def process(self, aircrafts: List[Dict], chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+        new = []
+        for ac in aircrafts:
+            icao = ac['icao']
+            if icao in self.tracked:
                 continue
-
-            # Определяем тип из базы (если есть)
             db_entry = self.db.get(icao)
             if db_entry:
-                aircraft_type = db_entry['type']
-                registration = db_entry['registration']
+                ac['type'] = db_entry['type']
+                ac['registration'] = db_entry['registration']
             else:
-                aircraft_type = aircraft.get('type', 'N/A')
-                registration = aircraft.get('registration', 'N/A')
-
-            if aircraft_type == 'N/A':
+                ac['type'] = ac.get('type', 'N/A')
+                ac['registration'] = ac.get('registration', 'N/A')
+            if ac['type'] == 'N/A' or not is_target(ac['type']):
                 continue
-
-            if not is_target_aircraft(aircraft_type):
-                continue
-
-            aircraft['type'] = aircraft_type
-            aircraft['registration'] = registration if registration != 'N/A' else aircraft.get('registration', 'N/A')
-            self.tracked_aircrafts[icao] = aircraft
-
-            clean_type = normalize_type(aircraft_type)
-            type_name = AIRCRAFT_NAMES.get(clean_type, aircraft_type)
-
-            message = (
+            self.tracked[icao] = ac
+            type_name = AIRCRAFT_NAMES.get(normalize_type(ac['type']), ac['type'])
+            msg = (
                 "🚨 Самолет обнаружен!\n"
-                f"🕒 Время: {aircraft['timestamp'].strftime('%d.%m.%Y %H:%M:%S')}\n"
+                f"🕒 Время: {ac['timestamp'].strftime('%d.%m.%Y %H:%M:%S')}\n"
                 f"▫️ ICAO: {icao}\n"
-                f"▫️ Регистрация: {aircraft['registration'] or 'N/A'}\n"
-                f"▫️ Позывной: {aircraft['call_sign'] or 'N/A'}\n"
+                f"▫️ Регистрация: {ac['registration'] or 'N/A'}\n"
+                f"▫️ Позывной: {ac['call_sign'] or 'N/A'}\n"
                 f"▫️ Тип: {type_name}\n"
-                f"▫️ Страна: {aircraft['country']}\n"
-                f"▫️ Координаты: {aircraft['coordinates']}"
+                f"▫️ Страна: {ac['country']}\n"
+                f"▫️ Координаты: {ac['coordinates']}"
             )
-
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=message,
-                disable_web_page_preview=True
-            )
-            new_detections.append(icao)
-
-        if new_detections:
-            logger.info(f"✅ Обнаружено {len(new_detections)} новых целей")
+            await context.bot.send_message(chat_id=chat_id, text=msg, disable_web_page_preview=True)
+            new.append(icao)
+        if new:
+            logger.info(f"✅ Обнаружено {len(new)} новых целей")
         else:
             logger.info("ℹ️ Новых целей не найдено")
 
-        return new_detections
-
-# ---------- Обработчики команд (без изменений) ----------
+# ---------- Обработчики команд Telegram ----------
 tracker = None
 
 def get_main_keyboard():
@@ -500,19 +593,14 @@ def get_main_keyboard():
     )
 
 def get_interval_keyboard():
-    options = [60, 300, 600, 1800, 3600]
-    buttons = []
-    for sec in options:
-        label = f"{sec // 60} мин"
-        buttons.append([KeyboardButton(label)])
+    buttons = [[KeyboardButton(f"{s} сек")] for s in [30, 60, 120, 300, 600]]
     buttons.append(["🔙 Назад"])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, is_persistent=True)
 
-async def _start_monitoring_for_chat(chat_id: int, context: ContextTypes.DEFAULT_TYPE, interval: Optional[int] = None):
+async def _start_monitoring(chat_id: int, context: ContextTypes.DEFAULT_TYPE, interval: Optional[int] = None):
     if context.job_queue is None:
         raise RuntimeError("JobQueue не доступен.")
-    jobs = context.job_queue.get_jobs_by_name(str(chat_id))
-    for job in jobs:
+    for job in context.job_queue.get_jobs_by_name(str(chat_id)):
         job.schedule_removal()
     if interval is None:
         interval = tracker.get_interval(chat_id)
@@ -531,18 +619,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text(
         "🛩 Мульти-трекер (OpenSky OAuth2, ADS-B, FR24)\n"
-        "Отслеживание только в заданных регионах.\n"
+        "Отслеживание в заданных регионах.\n"
         "Автоматически запускаю мониторинг...",
         reply_markup=get_main_keyboard()
     )
     try:
-        started = await _start_monitoring_for_chat(chat_id, context)
+        started = await _start_monitoring(chat_id, context)
         if started:
             interval = tracker.get_interval(chat_id)
             await update.message.reply_text(f"✅ Мониторинг активен (интервал: {interval} сек.)")
         else:
             await update.message.reply_text("⚠️ Мониторинг уже запущен.")
-    except RuntimeError as e:
+    except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -550,8 +638,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 *Мульти-трекер*\n\n"
         "Использует источники:\n"
         "- OpenSky (OAuth2) – требуется credentials.json\n"
-        "- ADS-B Exchange (с Referer)\n"
-        "- Flightradar24 (pyfr24) – если установлена\n\n"
+        "- ADS-B Exchange\n"
+        "- pyfr24 / FlightRadarAPI (если установлены)\n\n"
         "Фильтрует по регионам:\n"
         "Индийский океан, Восточно-Китайское, Южно-Китайское,\n"
         "Филиппинское, Японское, Жёлтое, Берингово, Чукотское,\n"
@@ -571,7 +659,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     interval = tracker.get_interval(chat_id)
     is_active = chat_id in tracker.active_chats
     await update.message.reply_text(
-        f"🔍 Отслежено бортов: {len(tracker.tracked_aircrafts)}\n"
+        f"🔍 Отслежено бортов: {len(tracker.tracked)}\n"
         f"⏱ Интервал: {interval} сек.\n"
         f"🟢 Мониторинг: {'активен' if is_active else 'остановлен'}\n"
         f"⏳ Последнее обновление: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
@@ -581,13 +669,13 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     try:
-        started = await _start_monitoring_for_chat(chat_id, context)
+        started = await _start_monitoring(chat_id, context)
         if started:
             interval = tracker.get_interval(chat_id)
             await update.message.reply_text(f"✅ Мониторинг запущен (интервал {interval} сек.).", reply_markup=get_main_keyboard())
         else:
             await update.message.reply_text("⚠️ Мониторинг уже активен.", reply_markup=get_main_keyboard())
-    except RuntimeError as e:
+    except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def stop_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -603,16 +691,14 @@ async def stop_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job.schedule_removal()
     tracker.active_chats.discard(chat_id)
     if not tracker.active_chats:
-        tracker.tracked_aircrafts.clear()
+        tracker.tracked.clear()
     await update.message.reply_text("⛔ Мониторинг остановлен", reply_markup=get_main_keyboard())
 
 async def interval_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     current = tracker.get_interval(chat_id)
     await update.message.reply_text(
-        f"⚙️ *Настройка интервала опроса*\n\n"
-        f"Текущий интервал: *{current} сек.*\n\n"
-        "Выберите новый интервал:",
+        f"⚙️ *Настройка интервала*\n\nТекущий: {current} сек.\nВыберите новый:",
         parse_mode="Markdown",
         reply_markup=get_interval_keyboard()
     )
@@ -620,37 +706,22 @@ async def interval_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_interval_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text
-
     if text == "🔙 Назад":
         await update.message.reply_text("Главное меню", reply_markup=get_main_keyboard())
         return
-
-    interval_map = {
-        "1 мин": 60,
-        "5 мин": 300,
-        "10 мин": 600,
-        "30 мин": 1800,
-        "60 мин": 3600
-    }
-    if text in interval_map:
-        new_interval = interval_map[text]
+    try:
+        new_interval = int(text.split()[0])
+        if new_interval < Config.MIN_INTERVAL:
+            await update.message.reply_text(f"Минимальный интервал – {Config.MIN_INTERVAL} сек.")
+            return
         tracker.set_interval(chat_id, new_interval)
         if chat_id in tracker.active_chats:
-            try:
-                await _start_monitoring_for_chat(chat_id, context, new_interval)
-                await update.message.reply_text(
-                    f"✅ Интервал изменён на {new_interval} сек. Мониторинг перезапущен.",
-                    reply_markup=get_main_keyboard()
-                )
-            except Exception as e:
-                await update.message.reply_text(f"❌ Ошибка при перезапуске: {e}", reply_markup=get_main_keyboard())
+            await _start_monitoring(chat_id, context, new_interval)
+            await update.message.reply_text(f"✅ Интервал изменён на {new_interval} сек. Мониторинг перезапущен.", reply_markup=get_main_keyboard())
         else:
-            await update.message.reply_text(
-                f"✅ Интервал сохранён ({new_interval} сек.). Запустите мониторинг для применения.",
-                reply_markup=get_main_keyboard()
-            )
-    else:
-        await update.message.reply_text("Неизвестный вариант. Используйте кнопки.", reply_markup=get_interval_keyboard())
+            await update.message.reply_text(f"✅ Интервал сохранён ({new_interval} сек.). Запустите мониторинг.", reply_markup=get_main_keyboard())
+    except Exception:
+        await update.message.reply_text("Неверный формат. Используйте кнопки.", reply_markup=get_interval_keyboard())
 
 async def set_interval_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -660,24 +731,21 @@ async def set_interval_command(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         seconds = int(context.args[0])
         if seconds < Config.MIN_INTERVAL:
-            await update.message.reply_text(f"Минимальный интервал – {Config.MIN_INTERVAL} секунд.")
+            await update.message.reply_text(f"Минимальный интервал – {Config.MIN_INTERVAL} сек.")
             return
         tracker.set_interval(chat_id, seconds)
         if chat_id in tracker.active_chats:
-            await _start_monitoring_for_chat(chat_id, context, seconds)
+            await _start_monitoring(chat_id, context, seconds)
             await update.message.reply_text(f"✅ Интервал изменён на {seconds} сек. Мониторинг перезапущен.", reply_markup=get_main_keyboard())
         else:
             await update.message.reply_text(f"✅ Интервал сохранён ({seconds} сек.). Запустите мониторинг.", reply_markup=get_main_keyboard())
     except ValueError:
         await update.message.reply_text("Введите число секунд.")
 
-async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Используйте кнопки ⬇️", reply_markup=get_main_keyboard())
 
-# ---------- HTTP-Healthcheck ----------
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
+# ---------- Healthcheck ----------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -693,34 +761,25 @@ def run_health_server(port=8080):
 # ---------- Запуск ----------
 def main():
     global tracker
-
-    health_thread = threading.Thread(target=run_health_server, args=(8080,), daemon=True)
-    health_thread.start()
-
+    threading.Thread(target=run_health_server, args=(8080,), daemon=True).start()
     db = AircraftDatabase()
     db.load_sync()
-
     tracker = AircraftTracker(db)
-
-    application = Application.builder().token(Config.BOT_TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("monitor", start_monitoring))
-    application.add_handler(CommandHandler("stop", stop_monitoring))
-    application.add_handler(CommandHandler("setinterval", set_interval_command))
-
-    application.add_handler(MessageHandler(filters.Text("🟢 Запустить мониторинг"), start_monitoring))
-    application.add_handler(MessageHandler(filters.Text("🔴 Остановить"), stop_monitoring))
-    application.add_handler(MessageHandler(filters.Text("📊 Статус"), status))
-    application.add_handler(MessageHandler(filters.Text("⚙️ Интервал"), interval_settings))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_interval_choice))
-
-    application.add_handler(MessageHandler(filters.ALL, unknown_command))
-
+    app = Application.builder().token(Config.BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("monitor", start_monitoring))
+    app.add_handler(CommandHandler("stop", stop_monitoring))
+    app.add_handler(CommandHandler("setinterval", set_interval_command))
+    app.add_handler(MessageHandler(filters.Text("🟢 Запустить мониторинг"), start_monitoring))
+    app.add_handler(MessageHandler(filters.Text("🔴 Остановить"), stop_monitoring))
+    app.add_handler(MessageHandler(filters.Text("📊 Статус"), status))
+    app.add_handler(MessageHandler(filters.Text("⚙️ Интервал"), interval_settings))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_interval_choice))
+    app.add_handler(MessageHandler(filters.ALL, unknown))
     logger.info("🚀 Бот запущен")
-    application.run_polling()
+    app.run_polling()
 
 if __name__ == "__main__":
     main()

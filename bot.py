@@ -4,6 +4,7 @@ import os
 import asyncio
 import re
 import socket
+import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set
 import requests
@@ -17,6 +18,7 @@ from telegram.ext import (
     filters,
     CallbackQueryHandler,
 )
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ---------- Импорт FlightRadarAPI (опционально) ----------
 try:
@@ -66,48 +68,8 @@ REGIONS = {
     "pacific_east": {"name": "🌊 Тихий океан (восток)", "lat_min": -60, "lat_max": 70, "lon_min": -180, "lon_max": -120},
 }
 
-# ---------- Целевые типы (расширенный список) ----------
-TARGET_CODES = {
-    # Транспортные и заправщики
-    'C130', 'KC130', 'MC130', 'C17', 'C5', 'C2',
-    'KC135', 'KC10', 'KC46', 'DC10', 'A400M',
-    'C30J', 'C27J', 'C295', 'C30', 'C5M', 'C2A',
-    # Бизнес-джеты (часто военные)
-    'GLF5', 'GLF6', 'GLEX', 'GL7T', 'GL5T',
-    'E545', 'E55P', 'CL35', 'C680', 'C700', 'FA6X',
-    'LJ45', 'LJ31', 'EMB505', 'CHALLENGER350', 'CHALLENGER300',
-    'CITATION', 'CITATIONCJ2', 'CITATIONV', 'CITATIONLATITUDE',
-    'P180', 'B200C', 'BE20', 'BE9L', 'TEX2', 'EC45', 'H60', 'AS65',
-    # Истребители и бомбардировщики
-    'F16', 'F15', 'F22', 'F35', 'F18', 'EA18G',
-    'B1', 'B2', 'B52', 'B1B', 'B2A',
-    # Разведчики и ДРЛО
-    'E3', 'E2', 'E8', 'E7', 'E4', 'E6', 'E767',
-    'P3', 'P8', 'U2', 'RC135', 'R135', 'K35R',
-    # Прочее
-    'P1', 'CP140', 'A400M', 'EC45', 'H60', 'AS65'
-}
-
-# ---------- Логирование ----------
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# ---------- Вспомогательные функции ----------
-def is_in_selected_regions(lat: float, lon: float, selected_regions: Set[str]) -> bool:
-    """Проверяет, находится ли точка в одном из выбранных регионов."""
-    if lat is None or lon is None:
-        return False
-    for region_key in selected_regions:
-        r = REGIONS[region_key]
-        if r["lat_min"] <= lat <= r["lat_max"] and r["lon_min"] <= lon <= r["lon_max"]:
-            return True
-    return False
-
-def get_country_by_registration(registration: str) -> str:
-  COUNTRY_CODES = {
+# ---------- Полные словари ----------
+COUNTRY_CODES = {
     'A2': '🇧🇼 Ботсвана', 'A3': '🇹🇴 Тонга', 'A4': '🇴🇲 Оман', 'A5': '🇧🇹 Бутан',
     'A6': '🇦🇪 ОАЭ', 'A7': '🇶🇦 Катар', 'A8': '🇱🇷 Либерия', 'A9': '🇧🇭 Бахрейн',
     'AP': '🇵🇰 Пакистан', 'B': '🇨🇳 Китай', 'C': '🇨🇦 Канада', 'CC': '🇨🇱 Чили',
@@ -152,7 +114,111 @@ def get_country_by_registration(registration: str) -> str:
     'UP': '🇰🇿 Казахстан', 'VH': '🇦🇺 Австралия', 'VP-B': '🇧🇲 Бермуды',
     'VP-L': '🇲🇴 Макао', 'VQ-H': '🇬🇬 Гернси', 'VQ-T': '🇹🇨 Теркс и Кайкос',
     'Z3': '🇲🇰 Северная Македония'
-}  # (полный словарь, вставьте его из предыдущих версий)
+}
+
+AIRCRAFT_NAMES = {
+    'B52': 'B-52 Stratofortress',
+    'C17': 'C-17 Globemaster III',
+    'F16': 'F-16 Fighting Falcon',
+    'F35': 'F-35 Lightning II',
+    'KC135': 'KC-135 Stratotanker',
+    'KC10': 'KC-10 Extender',
+    'E3': 'E-3 Sentry',
+    'U2': 'U-2 Dragon Lady',
+    'RC135': 'RC-135 Rivet Joint',
+    'C130': 'C-130 Hercules',
+    'A400M': 'A400M Atlas',
+    'P8': 'P-8 Poseidon',
+    'C5': 'C-5 Galaxy',
+    'C2': 'C-2 Greyhound',
+    'KC46': 'KC-46 Pegasus',
+    'DC10': 'DC-10',
+    'P1': 'P-1',
+    'CP140': 'CP-140 Aurora',
+    'F15': 'F-15 Eagle',
+    'F22': 'F-22 Raptor',
+    'F18': 'F/A-18 Hornet',
+    'EA18G': 'EA-18G Growler',
+    'B1': 'B-1 Lancer',
+    'B2': 'B-2 Spirit',
+    'E2': 'E-2 Hawkeye',
+    'E7': 'E-7 Wedgetail',
+    'E4': 'E-4 Nightwatch',
+    'E6': 'E-6 Mercury',
+    'E767': 'E-767',
+    'P3': 'P-3 Orion',
+    'E2C': 'E-2C Hawkeye',
+    'E2K': 'E-2K Hawkeye',
+    'E737': 'E-737 Wedgetail',
+    'C2A': 'C-2A Greyhound',
+    'K35R': 'KC-135R Stratotanker',
+    'R135': 'RC-135',
+    'C30': 'C-30',
+    'C30J': 'C-30J',
+    'C5M': 'C-5M Super Galaxy',
+    'E3TF': 'E-3 Sentry (Турция)',
+    'C17A': 'C-17A Globemaster III',
+    'KC135R': 'KC-135R Stratotanker',
+    'KC135T': 'KC-135T Stratotanker',
+    'KC10A': 'KC-10A Extender',
+    'KC46A': 'KC-46A Pegasus',
+    'F16C': 'F-16C Fighting Falcon',
+    'F15E': 'F-15E Strike Eagle',
+    'F22A': 'F-22A Raptor',
+    'F35A': 'F-35A Lightning II',
+    'F35B': 'F-35B Lightning II',
+    'F35C': 'F-35C Lightning II',
+    'B1B': 'B-1B Lancer',
+    'B2A': 'B-2A Spirit',
+    'E3G': 'E-3G Sentry',
+    'E2D': 'E-2D Advanced Hawkeye',
+    'P8A': 'P-8A Poseidon',
+    'MC130': 'MC-130',
+    'KC130': 'KC-130',
+    'KC130J': 'KC-130J'
+}
+
+# ---------- Целевые типы (расширенный список) ----------
+TARGET_CODES = {
+    # Транспортные и заправщики
+    'C130', 'KC130', 'MC130', 'C17', 'C5', 'C2',
+    'KC135', 'KC10', 'KC46', 'DC10', 'A400M',
+    'C30J', 'C27J', 'C295', 'C30', 'C5M', 'C2A',
+    # Бизнес-джеты (часто военные)
+    'GLF5', 'GLF6', 'GLEX', 'GL7T', 'GL5T',
+    'E545', 'E55P', 'CL35', 'C680', 'C700', 'FA6X',
+    'LJ45', 'LJ31', 'EMB505', 'CHALLENGER350', 'CHALLENGER300',
+    'CITATION', 'CITATIONCJ2', 'CITATIONV', 'CITATIONLATITUDE',
+    'P180', 'B200C', 'BE20', 'BE9L', 'TEX2', 'EC45', 'H60', 'AS65',
+    # Истребители и бомбардировщики
+    'F16', 'F15', 'F22', 'F35', 'F18', 'EA18G',
+    'B1', 'B2', 'B52', 'B1B', 'B2A',
+    # Разведчики и ДРЛО
+    'E3', 'E2', 'E8', 'E7', 'E4', 'E6', 'E767',
+    'P3', 'P8', 'U2', 'RC135', 'R135', 'K35R',
+    # Прочее
+    'P1', 'CP140', 'EC45', 'H60', 'AS65'
+}
+
+# ---------- Логирование ----------
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ---------- Вспомогательные функции ----------
+def is_in_selected_regions(lat: float, lon: float, selected_regions: Set[str]) -> bool:
+    """Проверяет, находится ли точка в одном из выбранных регионов."""
+    if lat is None or lon is None:
+        return False
+    for region_key in selected_regions:
+        r = REGIONS[region_key]
+        if r["lat_min"] <= lat <= r["lat_max"] and r["lon_min"] <= lon <= r["lon_max"]:
+            return True
+    return False
+
+def get_country_by_registration(registration: str) -> str:
     if not registration:
         return "🌍 Страна неизвестна"
     for prefix in sorted(COUNTRY_CODES.keys(), key=len, reverse=True):
@@ -181,12 +247,84 @@ def is_target_type(t: str) -> bool:
             return True
     return False
 
-# ---------- Загрузчик базы ICAO (полный) ----------
+# ---------- Загрузчик базы ICAO ----------
 class AircraftDatabase:
-    # ... (полный класс из предыдущего кода, без изменений) ...
-    pass  # Я пропущу для краткости, но он должен быть полностью скопирован
+    def __init__(self):
+        self.data: Dict[str, Dict[str, str]] = {}
+        self._loaded = False
 
-# ---------- Основной трекер с поддержкой настроек ----------
+    def load_sync(self):
+        if self._loaded:
+            return
+        if not os.path.exists(Config.LOCAL_DB_FILE):
+            logger.info("Скачиваю базу данных с Google Drive...")
+            self._download_sync()
+        else:
+            logger.info("Загрузка базы из локального файла")
+        self._load_from_file()
+        self._loaded = True
+        logger.info(f"База загружена: {len(self.data)} записей")
+
+    def _download_sync(self):
+        for attempt in range(1, Config.DB_RETRY_ATTEMPTS + 1):
+            try:
+                logger.info(f"Попытка {attempt} из {Config.DB_RETRY_ATTEMPTS} – скачивание с Google Drive")
+                resp = requests.get(Config.DATABASE_URL, stream=True, timeout=Config.DB_DOWNLOAD_TIMEOUT, allow_redirects=True)
+                if resp.status_code == 200:
+                    with open(Config.LOCAL_DB_FILE, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    logger.info("База успешно скачана с Google Drive")
+                    return
+                else:
+                    logger.warning(f"Google Drive ответил {resp.status_code}, пробую fallback...")
+                    break
+            except Exception as e:
+                logger.warning(f"Ошибка при скачивании с Google Drive (попытка {attempt}): {e}")
+                if attempt < Config.DB_RETRY_ATTEMPTS:
+                    import time
+                    time.sleep(Config.DB_RETRY_DELAY * attempt)
+                else:
+                    logger.info("Попытка скачать с оригинального OpenSky...")
+                    try:
+                        resp = requests.get(Config.FALLBACK_DATABASE_URL, stream=True, timeout=Config.DB_DOWNLOAD_TIMEOUT, allow_redirects=True)
+                        if resp.status_code == 200:
+                            with open(Config.LOCAL_DB_FILE, "wb") as f:
+                                for chunk in resp.iter_content(chunk_size=8192):
+                                    if chunk:
+                                        f.write(chunk)
+                            logger.info("База скачана с OpenSky (fallback)")
+                            return
+                    except Exception as e2:
+                        logger.error(f"Ошибка fallback: {e2}")
+        logger.error("Не удалось скачать базу данных. Будет использована пустая база.")
+        with open(Config.LOCAL_DB_FILE, "w") as f:
+            f.write("icao24,registration,model\n")
+        self.data = {}
+
+    def _load_from_file(self):
+        try:
+            with open(Config.LOCAL_DB_FILE, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    icao = row.get("icao24", "").strip().lower()
+                    if not icao:
+                        continue
+                    reg = row.get("registration", "").strip()
+                    typ = row.get("model", "").strip()
+                    self.data[icao] = {
+                        "registration": reg if reg else "N/A",
+                        "type": typ if typ else "N/A"
+                    }
+        except Exception as e:
+            logger.error(f"Ошибка чтения базы: {e}")
+            self.data = {}
+
+    def get(self, icao: str) -> Optional[Dict[str, str]]:
+        return self.data.get(icao.lower())
+
+# ---------- Основной трекер ----------
 class AircraftTracker:
     def __init__(self, db: AircraftDatabase):
         self.db = db
@@ -355,7 +493,7 @@ class AircraftTracker:
         chat_data = context.chat_data
 
         # Получаем настройки пользователя
-        selected_regions = chat_data.get('selected_regions', set(REGIONS.keys()))  # по умолчанию все
+        selected_regions = chat_data.get('selected_regions', set(REGIONS.keys()))
         filter_mode = chat_data.get('filter_mode', 'targets')  # 'targets' или 'all'
 
         if not selected_regions:
@@ -387,13 +525,11 @@ class AircraftTracker:
 
         # Фильтруем по типу (в зависимости от режима)
         if filter_mode == 'targets':
-            # Только целевые
             processed = []
             for ac in region_filtered:
                 icao = ac['icao']
                 if icao in self.tracked:
                     continue
-                # Определяем тип
                 db_entry = self.db.get(icao)
                 if db_entry:
                     ac['type'] = db_entry['type']
@@ -461,12 +597,10 @@ def get_interval_keyboard():
     buttons.append(["🔙 Назад"])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, is_persistent=True)
 
-# ---------- Обработчики настройки регионов ----------
+# ---------- Регионы ----------
 async def regions_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает меню выбора регионов с галочками."""
     chat_id = update.effective_chat.id
     selected = context.chat_data.get('selected_regions', set(REGIONS.keys()))
-
     keyboard = []
     for key, reg in REGIONS.items():
         check = "✅" if key in selected else "⬜"
@@ -474,7 +608,6 @@ async def regions_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append([InlineKeyboardButton("🔘 Выбрать все", callback_data="region_all")])
     keyboard.append([InlineKeyboardButton("🔘 Снять все", callback_data="region_none")])
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="region_back")])
-
     await update.message.reply_text(
         "🌍 *Выберите регионы для отслеживания:*\n"
         "Нажмите на регион, чтобы включить/выключить.",
@@ -483,19 +616,15 @@ async def regions_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает нажатия на кнопки регионов."""
     query = update.callback_query
     await query.answer()
     chat_id = update.effective_chat.id
     data = query.data
-
     if data == "region_back":
         await query.edit_message_text("Главное меню", reply_markup=None)
         await query.message.reply_text("Главное меню", reply_markup=get_main_keyboard())
         return
-
     selected = set(context.chat_data.get('selected_regions', set(REGIONS.keys())))
-
     if data == "region_all":
         selected = set(REGIONS.keys())
     elif data == "region_none":
@@ -506,10 +635,7 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             selected.remove(key)
         else:
             selected.add(key)
-
     context.chat_data['selected_regions'] = selected
-
-    # Обновляем клавиатуру
     keyboard = []
     for key, reg in REGIONS.items():
         check = "✅" if key in selected else "⬜"
@@ -517,7 +643,6 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append([InlineKeyboardButton("🔘 Выбрать все", callback_data="region_all")])
     keyboard.append([InlineKeyboardButton("🔘 Снять все", callback_data="region_none")])
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="region_back")])
-
     await query.edit_message_text(
         "🌍 *Выберите регионы для отслеживания:*\n"
         "Нажмите на регион, чтобы включить/выключить.",
@@ -527,19 +652,13 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Режим фильтрации ----------
 async def filter_mode_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает меню выбора режима фильтрации."""
-    chat_id = update.effective_chat.id
     current_mode = context.chat_data.get('filter_mode', 'targets')
-    mode_names = {
-        'targets': '🎯 Только целевые',
-        'all': '✈️ Все самолёты'
-    }
+    mode_names = {'targets': '🎯 Только целевые', 'all': '✈️ Все самолёты'}
     keyboard = []
     for mode, label in mode_names.items():
         check = "✅" if mode == current_mode else "⬜"
         keyboard.append([InlineKeyboardButton(f"{check} {label}", callback_data=f"filter_{mode}")])
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="filter_back")])
-
     await update.message.reply_text(
         "🎯 *Режим фильтрации*\n\n"
         "Выберите, какие самолёты показывать:",
@@ -548,16 +667,13 @@ async def filter_mode_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def filter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает выбор режима фильтрации."""
     query = update.callback_query
     await query.answer()
     data = query.data
-
     if data == "filter_back":
         await query.edit_message_text("Главное меню", reply_markup=None)
         await query.message.reply_text("Главное меню", reply_markup=get_main_keyboard())
         return
-
     if data.startswith("filter_"):
         mode = data[7:]
         context.chat_data['filter_mode'] = mode
@@ -568,15 +684,12 @@ async def filter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await query.message.reply_text("Главное меню", reply_markup=get_main_keyboard())
 
-# ---------- Остальные команды (старт, статус, мониторинг, интервал) ----------
+# ---------- Остальные команды ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    # Устанавливаем настройки по умолчанию
     if 'selected_regions' not in context.chat_data:
         context.chat_data['selected_regions'] = set(REGIONS.keys())
     if 'filter_mode' not in context.chat_data:
         context.chat_data['filter_mode'] = 'targets'
-
     await update.message.reply_text(
         "🛩 *Мульти-трекер с настройками*\n\n"
         "Вы можете:\n"
@@ -595,9 +708,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     selected = context.chat_data.get('selected_regions', set())
     filter_mode = context.chat_data.get('filter_mode', 'targets')
     mode_names = {'targets': '🎯 Только целевые', 'all': '✈️ Все самолёты'}
-
     regions_text = "\n".join([f"• {REGIONS[r]['name']}" for r in selected]) if selected else "❌ Не выбрано"
-
     await update.message.reply_text(
         f"📊 *Статус*\n\n"
         f"🟢 Мониторинг: {'активен' if is_active else 'остановлен'}\n"
@@ -616,10 +727,8 @@ async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.job_queue is None:
         await update.message.reply_text("❌ Планировщик не доступен.")
         return
-    # Удаляем старые задачи
     for job in context.job_queue.get_jobs_by_name(str(chat_id)):
         job.schedule_removal()
-
     interval = tracker.get_interval(chat_id)
     context.job_queue.run_repeating(
         tracker.monitor,
@@ -668,7 +777,6 @@ async def handle_interval_choice(update: Update, context: ContextTypes.DEFAULT_T
             return
         tracker.set_interval(chat_id, seconds)
         if chat_id in tracker.active_chats:
-            # Перезапускаем с новым интервалом
             for job in context.job_queue.get_jobs_by_name(str(chat_id)):
                 job.schedule_removal()
             context.job_queue.run_repeating(
@@ -717,9 +825,6 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Используйте кнопки ⬇️", reply_markup=get_main_keyboard())
 
 # ---------- Healthcheck ----------
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -755,11 +860,10 @@ def main():
     app.add_handler(MessageHandler(filters.Text("🌍 Регионы"), regions_menu))
     app.add_handler(MessageHandler(filters.Text("🎯 Режим фильтрации"), filter_mode_menu))
     app.add_handler(MessageHandler(filters.Text("⚙️ Интервал"), interval_settings))
-    app.add_handler(MessageHandler(filters.Text("🔙 Назад"), lambda u, c: u.message.reply_text("Главное меню", reply_markup=get_main_keyboard())))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_interval_choice))
     app.add_handler(MessageHandler(filters.ALL, unknown))
 
-    # Callback-запросы (инлайн-кнопки)
+    # Callback-запросы
     app.add_handler(CallbackQueryHandler(region_callback, pattern="^region_"))
     app.add_handler(CallbackQueryHandler(filter_callback, pattern="^filter_"))
 

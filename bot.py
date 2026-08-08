@@ -50,7 +50,7 @@ class Config:
     DATABASE_URL = "https://drive.google.com/uc?export=download&id=1sS8a5AZdiXMze8f08iNnVL7kTnlRuarl"
     FALLBACK_DATABASE_URL = "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv"
     LOCAL_DB_FILE = "aircraftDatabase.csv"
-    DEFAULT_INTERVAL = 30           # 30 секунд (минимальный разумный интервал)
+    DEFAULT_INTERVAL = 30           # 30 секунд
     MIN_INTERVAL = 15               # минимально допустимый интервал (сек)
     DB_DOWNLOAD_TIMEOUT = 90
     DB_RETRY_ATTEMPTS = 3
@@ -368,7 +368,7 @@ class AircraftTracker:
                         'registration': (data[9] or '').strip(),
                         'call_sign': (data[16] or '').strip(),
                         'type': aircraft_type,
-                        'operator': (data[18] or '').strip(),
+                        'operator': (data[18] or '').strip(),  # сохраняем для внутреннего использования, но не выводим
                         'lat': data[1] if len(data) > 1 else None,
                         'lon': data[2] if len(data) > 2 else None,
                         'timestamp': datetime.now()
@@ -432,7 +432,7 @@ class AircraftTracker:
             clean_type = normalize_type(aircraft_type)
             type_name = AIRCRAFT_NAMES.get(clean_type, aircraft_type)
 
-            # Формируем сообщение (убрали слово "Военный", убрали высоту и скорость)
+            # Формируем сообщение — без оператора, без высоты, без скорости
             message = (
                 "🚨 Самолет обнаружен!\n"
                 f"🕒 Время: {aircraft['timestamp'].strftime('%d.%m.%Y %H:%M:%S')}\n"
@@ -440,7 +440,6 @@ class AircraftTracker:
                 f"▫️ Регистрация: {aircraft['registration'] or 'N/A'}\n"
                 f"▫️ Позывной: {aircraft['call_sign'] or 'N/A'}\n"
                 f"▫️ Тип: {type_name}\n"
-                f"▫️ Оператор: {aircraft.get('operator', 'N/A') or 'N/A'}\n"
                 f"▫️ Страна: {aircraft['country']}\n"
                 f"▫️ Координаты: {aircraft['coordinates']}"
             )

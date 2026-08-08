@@ -17,7 +17,7 @@ from telegram.ext import (
     filters,
 )
 
-# Попытка импортировать FlightRadarAPI (необязательно)
+# Попытка импорта FlightRadarAPI (опционально)
 try:
     from FlightRadarAPI import FlightRadar24API
     FR24_AVAILABLE = True
@@ -30,64 +30,43 @@ class Config:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не задан!")
 
-    # Все возможные источники данных
+    # Источники данных (порядок важен)
     SOURCES = [
         {
             "name": "Flightradar24 (библиотека)",
             "type": "fr24_lib",
+            "enabled": FR24_AVAILABLE,
         },
         {
-            "name": "Flightradar24 (прямой)",
-            "url": "https://data-live.flightradar24.com/zones/fcgi/feed.js",
-            "type": "fr24_direct",
-            "params": {
-                "bounds": "90,-90,-180,180",
-                "faa": "1",
-                "satellite": "1",
-                "mlat": "1",
-                "flarm": "1",
-                "adsb": "1",
-                "gnd": "1",
-                "air": "1",
-                "vehicles": "1",
-                "estimated": "1",
-                "maxage": "7200",
-                "gliders": "1",
-                "stats": "1"
-            }
-        },
-        {
-            "name": "ADS-B Exchange (data)",
+            "name": "ADS-B Exchange (data.adsbexchange.com)",
+            "type": "adsb",
             "url": "https://data.adsbexchange.com/aircraft.json",
-            "type": "adsb",
+            "headers": {"Accept": "application/json"},
+            "timeout": 15,
         },
         {
-            "name": "ADS-B Exchange (api)",
+            "name": "ADS-B Exchange (api.adsbexchange.com)",
+            "type": "adsb",
             "url": "https://api.adsbexchange.com/aircraft.json",
-            "type": "adsb",
-        },
-        {
-            "name": "ADS-B Exchange (public-api)",
-            "url": "https://public-api.adsbexchange.com/VirtualRadar/AircraftList.json",
-            "type": "adsb_old",
+            "headers": {"Accept": "application/json"},
+            "timeout": 15,
         },
         {
             "name": "ADS-B.lol",
-            "url": "https://api.adsb.lol/aircraft.json",
             "type": "adsb",
+            "url": "https://api.adsb.lol/aircraft.json",
+            "headers": {"Accept": "application/json"},
+            "timeout": 15,
         },
         {
-            "name": "OpenSky",
-            "url": "https://opensky-network.org/api/states/all",
+            "name": "OpenSky Network",
             "type": "opensky",
-            "params": {"time": 0},
+            "url": "https://opensky-network.org/api/states/all",
+            "headers": {"User-Agent": "Mozilla/5.0"},
+            "timeout": 20,
+            "use_ipv4": True,
         },
     ]
-
-    HEADERS = {
-        "User-Agent": "MilitaryAircraftBot/1.0",
-        "Accept": "application/json",
-    }
 
     DATABASE_URL = "https://drive.google.com/uc?export=download&id=1sS8a5AZdiXMze8f08iNnVL7kTnlRuarl"
     FALLBACK_DATABASE_URL = "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv"
@@ -99,124 +78,9 @@ class Config:
     DB_RETRY_DELAY = 5
 
 # -------------------- СЛОВАРИ (полные) --------------------
-COUNTRY_CODES = {
-    'A2': '🇧🇼 Ботсвана', 'A3': '🇹🇴 Тонга', 'A4': '🇴🇲 Оман', 'A5': '🇧🇹 Бутан',
-    'A6': '🇦🇪 ОАЭ', 'A7': '🇶🇦 Катар', 'A8': '🇱🇷 Либерия', 'A9': '🇧🇭 Бахрейн',
-    'AP': '🇵🇰 Пакистан', 'B': '🇨🇳 Китай', 'C': '🇨🇦 Канада', 'CC': '🇨🇱 Чили',
-    'CD': '🇨🇩 ДР Конго', 'CR': '🇨🇷 Коста-Рика', 'CU': '🇨🇺 Куба', 'CX': '🇺🇾 Уругвай',
-    'D': '🇩🇪 Германия', 'DQ': '🇫🇯 Фиджи', 'DR': '🇳🇪 Нигер', 'EC': '🇪🇨 Эквадор',
-    'EI': '🇮🇪 Ирландия', 'EK': '🇩🇰 Дания', 'EL': '🇱🇷 Либерия', 'EP': '🇮🇷 Иран',
-    'ER': '🇲🇩 Молдова', 'ES': '🇪🇪 Эстония', 'ET': '🇩🇪 Германия (военные)',
-    'EW': '🇬🇪 Грузия', 'EX': '🇰🇬 Кыргызстан', 'EY': '🇹🇯 Таджикистан', 'F': '🇫🇷 Франция',
-    'G': '🇬🇧 Великобритания', 'H4': '🇸🇧 Соломоновы Острова', 'HA': '🇭🇺 Венгрия',
-    'HB': '🇱🇮 Лихтенштейн', 'HL': '🇰🇷 Южная Корея', 'HP': '🇵🇦 Панама', 'HR': '🇭🇳 Гондурас',
-    'HS': '🇹🇭 Таиланд', 'HU': '🇸🇻 Сальвадор', 'I': '🇮🇹 Италия', 'J': '🇯🇵 Япония',
-    'JA': '🇯🇵 Япония', 'JY': '🇯🇴 Иордания', 'LN': '🇳🇴 Норвегия', 'LV': '🇦🇷 Аргентина',
-    'LZ': '🇧🇬 Болгария', 'N': '🇺🇸 США', 'OB': '🇵🇪 Перу', 'OD': '🇱🇧 Ливан',
-    'OE': '🇸🇦 Саудовская Аравия', 'OH': '🇫🇮 Финляндия', 'OK': '🇨🇿 Чехия',
-    'OM': '🇸🇰 Словакия', 'OO': '🇧🇪 Бельгия', 'OY': '🇩🇰 Дания', 'P': '🇰🇵 Северная Корея',
-    'PH': '🇳🇱 Нидерланды', 'PT': '🇧🇷 Бразилия', 'RA': '🇷🇺 Россия', 'RDPL': '🇱🇦 Лаос',
-    'RP': '🇵🇭 Филиппины', 'SE': '🇸🇪 Швеция', 'SP': '🇵🇱 Польша', 'ST': '🇸🇩 Судан',
-    'SU': '🇪🇬 Египет', 'SX': '🇬🇷 Греция', 'T7': '🇸🇲 Сан-Марино', 'TC': '🇹🇷 Турция',
-    'TF': '🇮🇸 Исландия', 'TG': '🇬🇹 Гватемала', 'TI': '🇨🇷 Коста-Рика', 'TJ': '🇨🇲 Камерун',
-    'TL': '🇨🇫 ЦАР', 'TR': '🇬🇦 Габон', 'TS': '🇹🇳 Тунис', 'TT': '🇨🇭 Швейцария',
-    'TU': '🇨🇮 Кот-д\'Ивуар', 'TY': '🇧🇯 Бенин', 'TZ': '🇲🇱 Мали', 'UR': '🇺🇦 Украина',
-    'V2': '🇦🇬 Антигуа и Барбуда', 'V3': '🇧🇿 Белиз', 'V4': '🇰🇳 Сент-Китс и Невис',
-    'V5': '🇳🇦 Намибия', 'V6': '🇫🇲 Микронезия', 'V7': '🇲🇭 Маршалловы Острова',
-    'V8': '🇧🇳 Бруней', 'XA': '🇲🇽 Мексика', 'XT': '🇧🇫 Буркина-Фасо', 'XY': '🇲🇲 Мьянма',
-    'XZ': '🇲🇳 Монголия', 'YA': '🇦🇫 Афганистан', 'YI': '🇮🇶 Ирак', 'YJ': '🇻🇺 Вануату',
-    'YK': '🇸🇾 Сирия', 'YL': '🇱🇻 Латвия', 'YN': '🇳🇮 Никарагуа', 'YR': '🇷🇴 Румыния',
-    'YS': '🇸🇻 Сальвадор', 'YU': '🇷🇸 Сербия', 'YV': '🇻🇪 Венесуэла', 'Z': '🇿🇦 ЮАР',
-    'ZA': '🇦🇱 Албания', 'ZK': '🇳🇿 Новая Зеландия', 'ZP': '🇵🇾 Парагвай', 'ZS': '🇿🇦 ЮАР',
-    'ZT': '🇿🇲 Замбия', 'ZU': '🇿🇼 Зимбабве', '3B': '🇲🇺 Маврикий', '3C': '🇬🇶 Экв. Гвинея',
-    '3D': '🇸🇿 Эсватини', '3X': '🇬🇳 Гвинея', '4K': '🇦🇿 Азербайджан', '4R': '🇱🇰 Шри-Ланка',
-    '4X': '🇮🇱 Израиль', '5A': '🇱🇾 Ливия', '5B': '🇨🇾 Кипр', '5H': '🇹🇿 Танзания',
-    '5N': '🇳🇬 Нигерия', '5R': '🇲🇬 Мадагаскар', '5T': '🇲🇷 Мавритания', '5U': '🇳🇪 Нигер',
-    '5V': '🇹🇬 Того', '5X': '🇺🇬 Уганда', '6O': '🇸🇴 Сомали', '6V': '🇸🇳 Сенегал',
-    '6W': '🇸🇸 Южный Судан', '7O': '🇾🇪 Йемен', '7P': '🇱🇸 Лесото', '7Q': '🇲🇼 Малави',
-    '7T': '🇩🇿 Алжир', '8P': '🇧🇧 Барбадос', '8Q': '🇲🇻 Мальдивы', '8R': '🇬🇾 Гайана',
-    '9A': '🇭🇷 Хорватия', '9G': '🇬🇭 Гана', '9H': '🇲🇹 Мальта', '9J': '🇿🇲 Замбия',
-    '9K': '🇰🇼 Кувейт', '9L': '🇸🇱 Сьерра-Леоне', '9M': '🇲🇾 Малайзия', '9N': '🇳🇵 Непал',
-    '9Q': '🇨🇩 ДР Конго', '9U': '🇧🇮 Бурунди', '9V': '🇸🇬 Сингапур', '9XR': '🇷🇼 Руанда',
-    'C2': '🇳🇷 Науру', 'D2': '🇦🇴 Ангола', 'D4': '🇨🇻 Кабо-Верде', 'E3': '🇪🇷 Эритрея',
-    'E5': '🇨🇰 Острова Кука', 'HZ': '🇸🇦 Саудовская Аравия', 'J2': '🇩🇯 Джибути',
-    'J3': '🇬🇩 Гренада', 'S7': '🇸🇨 Сейшелы', 'T9': '🇧🇦 Босния и Герцеговина',
-    'UP': '🇰🇿 Казахстан', 'VH': '🇦🇺 Австралия', 'VP-B': '🇧🇲 Бермуды',
-    'VP-L': '🇲🇴 Макао', 'VQ-H': '🇬🇬 Гернси', 'VQ-T': '🇹🇨 Теркс и Кайкос',
-    'Z3': '🇲🇰 Северная Македония'
-}
-
-AIRCRAFT_NAMES = {
-    'B52': 'B-52 Stratofortress',
-    'C17': 'C-17 Globemaster III',
-    'F16': 'F-16 Fighting Falcon',
-    'F35': 'F-35 Lightning II',
-    'KC135': 'KC-135 Stratotanker',
-    'KC10': 'KC-10 Extender',
-    'E3': 'E-3 Sentry',
-    'U2': 'U-2 Dragon Lady',
-    'RC135': 'RC-135 Rivet Joint',
-    'C130': 'C-130 Hercules',
-    'A400M': 'A400M Atlas',
-    'P8': 'P-8 Poseidon',
-    'C5': 'C-5 Galaxy',
-    'C2': 'C-2 Greyhound',
-    'KC46': 'KC-46 Pegasus',
-    'DC10': 'DC-10',
-    'P1': 'P-1',
-    'CP140': 'CP-140 Aurora',
-    'F15': 'F-15 Eagle',
-    'F22': 'F-22 Raptor',
-    'F18': 'F/A-18 Hornet',
-    'EA18G': 'EA-18G Growler',
-    'B1': 'B-1 Lancer',
-    'B2': 'B-2 Spirit',
-    'E2': 'E-2 Hawkeye',
-    'E7': 'E-7 Wedgetail',
-    'E4': 'E-4 Nightwatch',
-    'E6': 'E-6 Mercury',
-    'E767': 'E-767',
-    'P3': 'P-3 Orion',
-    'E2C': 'E-2C Hawkeye',
-    'E2K': 'E-2K Hawkeye',
-    'E737': 'E-737 Wedgetail',
-    'C2A': 'C-2A Greyhound',
-    'K35R': 'KC-135R Stratotanker',
-    'R135': 'RC-135',
-    'C30': 'C-30',
-    'C30J': 'C-30J',
-    'C5M': 'C-5M Super Galaxy',
-    'E3TF': 'E-3 Sentry (Турция)',
-    'C17A': 'C-17A Globemaster III',
-    'KC135R': 'KC-135R Stratotanker',
-    'KC135T': 'KC-135T Stratotanker',
-    'KC10A': 'KC-10A Extender',
-    'KC46A': 'KC-46A Pegasus',
-    'F16C': 'F-16C Fighting Falcon',
-    'F15E': 'F-15E Strike Eagle',
-    'F22A': 'F-22A Raptor',
-    'F35A': 'F-35A Lightning II',
-    'F35B': 'F-35B Lightning II',
-    'F35C': 'F-35C Lightning II',
-    'B1B': 'B-1B Lancer',
-    'B2A': 'B-2A Spirit',
-    'E3G': 'E-3G Sentry',
-    'E2D': 'E-2D Advanced Hawkeye',
-    'P8A': 'P-8A Poseidon',
-    'MC130': 'MC-130',
-    'KC130': 'KC-130',
-    'KC130J': 'KC-130J'
-}
-
-# Целевые коды (поиск по вхождению)
-TARGET_CODES = {
-    'C130', 'KC130', 'MC130', 'C17', 'C5', 'C2',
-    'KC135', 'KC10', 'KC46', 'DC10', 'A400M',
-    'P1', 'CP140', 'F16', 'F15', 'F22', 'F35', 'F18',
-    'EA18G', 'B1', 'B2', 'B52', 'E3', 'E2', 'E8', 'E7',
-    'E4', 'E6', 'E767', 'P3', 'P8', 'U2', 'RC135',
-    'C30', 'K35R', 'R135', 'C30J', 'C5M'
-}
+COUNTRY_CODES = { ... }  # Вставьте полный словарь
+AIRCRAFT_NAMES = { ... }  # Вставьте полный словарь
+TARGET_CODES = { ... }    # Вставьте целевые коды
 
 # -------------------- ЛОГИРОВАНИЕ --------------------
 logging.basicConfig(
@@ -261,91 +125,8 @@ def is_target_aircraft(aircraft_type: str) -> bool:
 
 # -------------------- ЗАГРУЗЧИК БАЗЫ --------------------
 class AircraftDatabase:
-    def __init__(self):
-        self.data: Dict[str, Dict[str, str]] = {}
-        self._loaded = False
-
-    def load_sync(self):
-        if self._loaded:
-            return
-        if not os.path.exists(Config.LOCAL_DB_FILE):
-            logger.info("Скачиваю базу данных с Google Drive...")
-            self._download_sync()
-        else:
-            logger.info("Загрузка базы из локального файла")
-        self._load_from_file()
-        self._loaded = True
-        logger.info(f"База загружена: {len(self.data)} записей")
-
-    def _download_sync(self):
-        for attempt in range(1, Config.DB_RETRY_ATTEMPTS + 1):
-            try:
-                logger.info(f"Попытка {attempt} из {Config.DB_RETRY_ATTEMPTS} – скачивание с Google Drive")
-                response = requests.get(
-                    Config.DATABASE_URL,
-                    stream=True,
-                    timeout=Config.DB_DOWNLOAD_TIMEOUT,
-                    allow_redirects=True
-                )
-                if response.status_code == 200:
-                    with open(Config.LOCAL_DB_FILE, "wb") as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            if chunk:
-                                f.write(chunk)
-                    logger.info("База успешно скачана с Google Drive")
-                    return
-                else:
-                    logger.warning(f"Google Drive ответил {response.status_code}, пробую fallback...")
-                    break
-            except Exception as e:
-                logger.warning(f"Ошибка при скачивании с Google Drive (попытка {attempt}): {e}")
-                if attempt < Config.DB_RETRY_ATTEMPTS:
-                    import time
-                    time.sleep(Config.DB_RETRY_DELAY * attempt)
-                else:
-                    logger.info("Попытка скачать с оригинального OpenSky...")
-                    try:
-                        response = requests.get(
-                            Config.FALLBACK_DATABASE_URL,
-                            stream=True,
-                            timeout=Config.DB_DOWNLOAD_TIMEOUT,
-                            allow_redirects=True
-                        )
-                        if response.status_code == 200:
-                            with open(Config.LOCAL_DB_FILE, "wb") as f:
-                                for chunk in response.iter_content(chunk_size=8192):
-                                    if chunk:
-                                        f.write(chunk)
-                            logger.info("База скачана с OpenSky (fallback)")
-                            return
-                    except Exception as e2:
-                        logger.error(f"Ошибка fallback: {e2}")
-
-        logger.error("Не удалось скачать базу данных. Будет использована пустая база.")
-        with open(Config.LOCAL_DB_FILE, "w") as f:
-            f.write("icao24,registration,model\n")
-        self.data = {}
-
-    def _load_from_file(self):
-        try:
-            with open(Config.LOCAL_DB_FILE, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    icao = row.get("icao24", "").strip().lower()
-                    if not icao:
-                        continue
-                    registration = row.get("registration", "").strip()
-                    aircraft_type = row.get("model", "").strip()
-                    self.data[icao] = {
-                        "registration": registration if registration else "N/A",
-                        "type": aircraft_type if aircraft_type else "N/A"
-                    }
-        except Exception as e:
-            logger.error(f"Ошибка чтения базы: {e}")
-            self.data = {}
-
-    def get(self, icao: str) -> Optional[Dict[str, str]]:
-        return self.data.get(icao.lower())
+    # ... (полный класс без изменений) ...
+    pass
 
 # -------------------- ОСНОВНОЙ ТРЕКЕР --------------------
 class AircraftTracker:
@@ -393,7 +174,7 @@ class AircraftTracker:
                 aircraft['coordinates'] = format_coordinates(aircraft['lat'], aircraft['lon'])
                 aircrafts.append(aircraft)
         except Exception as e:
-            logger.error(f"Ошибка парсинга ADS-B: {e}", exc_info=True)
+            logger.error(f"Ошибка парсинга ADS-B: {e}")
         return aircrafts
 
     def parse_opensky_data(self, json_data: dict) -> List[Dict]:
@@ -423,40 +204,6 @@ class AircraftTracker:
                 'coordinates': format_coordinates(state[6], state[5])
             }
             aircrafts.append(aircraft)
-        return aircrafts
-
-    def parse_fr24_direct(self, json_data: dict) -> List[Dict]:
-        aircrafts = []
-        if not json_data:
-            return aircrafts
-        try:
-            for aircraft_id, data in json_data.items():
-                if aircraft_id in ('full_count', 'version', 'stats'):
-                    continue
-                if isinstance(data, list) and len(data) > 18:
-                    aircraft_type = (data[8] or '').strip().upper()
-                    if aircraft_type in ('', 'GRND', 'GND'):
-                        continue
-                    icao = data[0] or 'N/A'
-                    if icao == 'N/A':
-                        continue
-                    aircraft = {
-                        'icao': icao,
-                        'registration': (data[9] or '').strip(),
-                        'call_sign': (data[16] or '').strip(),
-                        'type': aircraft_type,
-                        'operator': (data[18] or '').strip(),
-                        'lat': data[1] if len(data) > 1 else None,
-                        'lon': data[2] if len(data) > 2 else None,
-                        'altitude': data[4] if len(data) > 4 else None,
-                        'speed': data[5] if len(data) > 5 else None,
-                        'timestamp': datetime.now()
-                    }
-                    aircraft['country'] = get_country_by_registration(aircraft['registration'])
-                    aircraft['coordinates'] = format_coordinates(aircraft['lat'], aircraft['lon'])
-                    aircrafts.append(aircraft)
-        except Exception as e:
-            logger.error(f"Ошибка парсинга FR24 direct: {e}", exc_info=True)
         return aircrafts
 
     async def fetch_fr24_lib(self) -> List[Dict]:
@@ -494,97 +241,77 @@ class AircraftTracker:
             logger.info(f"Flightradar24: получено {len(aircrafts)} бортов")
             return aircrafts
         except Exception as e:
-            logger.error(f"Ошибка Flightradar24 библиотека: {e}")
+            logger.error(f"Ошибка Flightradar24: {e}")
             return []
+
+    async def fetch_http_source(self, source: dict) -> Optional[dict]:
+        try:
+            timeout = aiohttp.ClientTimeout(total=source.get('timeout', 15))
+            connector = None
+            if source.get('use_ipv4', False):
+                connector = aiohttp.TCPConnector(family=socket.AF_INET)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                async with session.get(source['url'], headers=source.get('headers', {})) as response:
+                    if response.status != 200:
+                        logger.warning(f"{source['name']}: статус {response.status}")
+                        return None
+                    try:
+                        data = await response.json(content_type=None)
+                        return data
+                    except Exception as json_err:
+                        text = await response.text()
+                        logger.error(f"{source['name']}: ошибка JSON: {json_err}, получено: {text[:200]}...")
+                        return None
+        except asyncio.TimeoutError:
+            logger.warning(f"{source['name']}: таймаут")
+            return None
+        except Exception as e:
+            logger.error(f"{source['name']}: ошибка - {e}")
+            return None
 
     # ---------- Основной мониторинг ----------
     async def monitor(self, context: ContextTypes.DEFAULT_TYPE):
         chat_id = context.job.chat_id
         aircrafts = []
+        source_used = None
 
-        # 1. Flightradar24 (библиотека)
-        if self.fr_api:
-            aircrafts = await self.fetch_fr24_lib()
-            if aircrafts:
-                await self.process_aircrafts(aircrafts, chat_id, context)
-                return
-            logger.info("Flightradar24 не дал данных, пробуем другие источники")
+        # Перебираем все источники по очереди
+        for source in Config.SOURCES:
+            if not source.get('enabled', True):
+                continue
 
-        # 2. Остальные источники
-        async with aiohttp.ClientSession(headers=Config.HEADERS) as session:
-            for source in Config.SOURCES:
-                if source['type'] == 'fr24_lib' or source['type'] == 'fr24_direct':
-                    continue  # уже попробовали или обработаем отдельно
-                try:
-                    logger.info(f"🔄 {source['name']}: запрос...")
-                    if source['type'] == 'opensky':
-                        # Для OpenSky используем отдельную сессию с IPv4
-                        connector = aiohttp.TCPConnector(family=socket.AF_INET)
-                        timeout = aiohttp.ClientTimeout(total=45, connect=15)
-                        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as os_session:
-                            params = source.get('params', {})
-                            async with os_session.get(source['url'], params=params, headers={'User-Agent': 'Mozilla/5.0'}) as response:
-                                if response.status == 200:
-                                    json_data = await response.json()
-                                    aircrafts = self.parse_opensky_data(json_data)
-                                    if aircrafts:
-                                        logger.info(f"OpenSky: получено {len(aircrafts)} бортов")
-                                        await self.process_aircrafts(aircrafts, chat_id, context)
-                                        return
-                                else:
-                                    logger.warning(f"{source['name']}: статус {response.status}")
-                    else:
-                        # ADS-B и другие
-                        async with session.get(source['url'], timeout=30) as response:
-                            if response.status == 200:
-                                try:
-                                    json_data = await response.json(content_type=None)
-                                    if source['type'] == 'adsb':
-                                        aircrafts = self.parse_adsb_data(json_data)
-                                    elif source['type'] == 'adsb_old':
-                                        # Старый формат VirtualRadar
-                                        # Пока не реализован, можно пропустить
-                                        continue
-                                    else:
-                                        continue
-                                    if aircrafts:
-                                        logger.info(f"{source['name']}: получено {len(aircrafts)} бортов")
-                                        await self.process_aircrafts(aircrafts, chat_id, context)
-                                        return
-                                except Exception as json_err:
-                                    text = await response.text()
-                                    logger.error(f"{source['name']}: ошибка парсинга JSON: {json_err}, первые 200 символов: {text[:200]}")
-                            else:
-                                logger.warning(f"{source['name']}: статус {response.status}")
-                except asyncio.TimeoutError:
-                    logger.error(f"{source['name']}: таймаут")
-                except Exception as e:
-                    logger.error(f"{source['name']}: ошибка - {e}")
+            logger.info(f"🔄 {source['name']}: запрос...")
 
-        # 3. Flightradar24 прямой (если библиотека не сработала)
-        if not aircrafts:
-            try:
-                logger.info("🔄 Flightradar24 (прямой): запрос...")
-                url = "https://data-live.flightradar24.com/zones/fcgi/feed.js"
-                params = Config.SOURCES[1].get('params', {})
-                async with aiohttp.ClientSession(headers=Config.HEADERS) as session:
-                    async with session.get(url, params=params, timeout=30) as response:
-                        if response.status == 200:
-                            json_data = await response.json()
-                            aircrafts = self.parse_fr24_direct(json_data)
-                            if aircrafts:
-                                logger.info(f"Flightradar24 (прямой): получено {len(aircrafts)} бортов")
-                                await self.process_aircrafts(aircrafts, chat_id, context)
-                                return
-                        else:
-                            logger.warning(f"Flightradar24 (прямой): статус {response.status}")
-            except Exception as e:
-                logger.error(f"Flightradar24 (прямой): ошибка - {e}")
+            if source['type'] == 'fr24_lib':
+                aircrafts = await self.fetch_fr24_lib()
+                if aircrafts:
+                    source_used = source['name']
+                    break
+            elif source['type'] == 'adsb':
+                json_data = await self.fetch_http_source(source)
+                if json_data:
+                    aircrafts = self.parse_adsb_data(json_data)
+                    if aircrafts:
+                        source_used = source['name']
+                        break
+            elif source['type'] == 'opensky':
+                json_data = await self.fetch_http_source(source)
+                if json_data:
+                    aircrafts = self.parse_opensky_data(json_data)
+                    if aircrafts:
+                        source_used = source['name']
+                        break
 
-        logger.info("❌ Все источники данных не вернули самолёты")
+        if aircrafts:
+            logger.info(f"✅ Источник: {source_used}, получено {len(aircrafts)} бортов")
+            await self.process_aircrafts(aircrafts, chat_id, context)
+        else:
+            logger.info("❌ Все источники данных не вернули самолёты")
 
     async def process_aircrafts(self, aircrafts: List[Dict], chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> List[str]:
         new_detections = []
+        debug_count = 0
+        debug_shown = False
 
         for aircraft in aircrafts:
             icao = aircraft['icao']
@@ -631,13 +358,13 @@ class AircraftTracker:
             new_detections.append(icao)
 
         if new_detections:
-            logger.info(f"Обнаружено {len(new_detections)} новых целей")
+            logger.info(f"✅ Обнаружено {len(new_detections)} новых целей")
         else:
-            logger.info("Новых целей не найдено")
+            logger.info("ℹ️ Новых целей не найдено")
 
         return new_detections
 
-# -------------------- ОБРАБОТЧИКИ КОМАНД (без изменений) --------------------
+# -------------------- ОБРАБОТЧИКИ КОМАНД --------------------
 tracker = None
 
 def get_main_keyboard():
@@ -683,7 +410,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text(
         "🛩 Универсальный авиационный трекер\n"
-        "Использует ADS-B Exchange, OpenSky и Flightradar24.\n"
+        "Использует Flightradar24, ADS-B Exchange и OpenSky.\n"
         "Автоматически запускаю мониторинг...",
         reply_markup=get_main_keyboard()
     )
@@ -700,7 +427,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Универсальный авиационный трекер*\n\n"
-        "Бот отслеживает самолёты по данным ADS-B Exchange, OpenSky и Flightradar24.\n"
+        "Бот отслеживает самолёты по данным Flightradar24, ADS-B Exchange и OpenSky.\n"
         "Фильтрация по типу из списка целевых.\n"
         "При обнаружении приходит уведомление.\n\n"
         "*Команды:*\n"

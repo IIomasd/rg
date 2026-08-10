@@ -32,7 +32,6 @@ class Config:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не задан!")
 
-    # Прокси (можно заменить или убрать)
     PROXY = "http://bjumcuxv:lodgiq7akwo7@31.59.20.176:6754"
 
     OPENSKY_URL = "https://opensky-network.org/api/states/all"
@@ -63,7 +62,7 @@ REGIONS = {
     }
 }
 
-# ---------- Полные словари (сокращён для экономии места, но вы можете оставить полный) ----------
+# ---------- Полные словари (сокращён для экономии, но вы можете оставить полный) ----------
 COUNTRY_CODES = {
     'A2': '🇧🇼 Ботсвана', 'A3': '🇹🇴 Тонга', 'A4': '🇴🇲 Оман', 'A5': '🇧🇹 Бутан',
     'A6': '🇦🇪 ОАЭ', 'A7': '🇶🇦 Катар', 'A8': '🇱🇷 Либерия', 'A9': '🇧🇭 Бахрейн',
@@ -203,6 +202,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------- Вспомогательные функции ----------
+def normalize_type(t: str) -> str:
+    if not t:
+        return ""
+    return re.sub(r'[^A-Z0-9]', '', t.upper())
+
+# Нормализованные целевые коды для точного сравнения
+NORMALIZED_TARGET_CODES = {normalize_type(code) for code in TARGET_CODES}
+
+def is_target_type(aircraft_type: str) -> bool:
+    clean_type = normalize_type(aircraft_type)
+    if not clean_type or clean_type == "NA":
+        return False
+    is_target = clean_type in NORMALIZED_TARGET_CODES
+    logger.debug(
+        "Тип %r -> %r, целевой: %s",
+        aircraft_type,
+        clean_type,
+        is_target,
+    )
+    return is_target
+
 def is_in_selected_regions(lat: float, lon: float, selected_regions: Set[str]) -> bool:
     """Проверяет, находится ли точка в одном из выбранных регионов.
        Поддерживает пересечение через 180-й меридиан."""
@@ -233,23 +253,6 @@ def format_coordinates(lat: float, lon: float) -> str:
     lat_dir = "С" if lat >= 0 else "Ю"
     lon_dir = "В" if lon >= 0 else "З"
     return f"{abs(lat):.2f}°{lat_dir}, {abs(lon):.2f}°{lon_dir}"
-
-def normalize_type(t: str) -> str:
-    if not t:
-        return ""
-    return re.sub(r'[^A-Z0-9]', '', t.upper())
-
-def is_target_type(t: str) -> bool:
-    if not t:
-        return False
-    clean = normalize_type(t)
-    # Проверяем, содержится ли один из кодов в clean
-    for code in TARGET_CODES:
-        if code in clean:
-            logger.debug(f"Тип '{t}' -> нормализовано '{clean}', совпало с кодом '{code}'")
-            return True
-    logger.debug(f"Тип '{t}' -> нормализовано '{clean}' НЕ является целевым")
-    return False
 
 # ---------- Загрузчик базы ICAO ----------
 class AircraftDatabase:
@@ -521,28 +524,36 @@ class AircraftTracker:
         if not region_filtered:
             return
 
-        # Фильтруем только целевые типы (исключительно по списку TARGET_CODES)
+        # Фильтруем только целевые типы (строгое сравнение)
         processed = []
         for ac in region_filtered:
             icao = ac['icao']
             if icao in self.tracked:
                 continue
 
-            # Получаем тип из базы, если есть
+            # ---------- ИСПРАВЛЕННЫЙ БЛОК ПОЛУЧЕНИЯ ТИПА ИЗ БАЗЫ ----------
             db_entry = self.db.get(icao)
-            if db_entry:
-                ac['type'] = db_entry['type']
+
+            source_type = ac.get('type')
+            db_type = db_entry.get('type') if db_entry else None
+
+            # Используем тип из базы, только если он не пустой и не 'N/A'/'NA'/'UNKNOWN'
+            if db_type and normalize_type(db_type) not in {"", "NA", "UNKNOWN"}:
+                ac['type'] = db_type
+            else:
+                ac['type'] = source_type or 'N/A'
+
+            # Регистрация: если в базе есть, берём её, иначе оставляем источник
+            if db_entry and db_entry.get('registration'):
                 ac['registration'] = db_entry['registration']
             else:
-                ac['type'] = ac.get('type', 'N/A')
-                ac['registration'] = ac.get('registration', 'N/A')
+                ac['registration'] = ac.get('registration') or 'N/A'
 
-            # Проверяем, является ли тип целевым
+            # Проверяем, является ли тип целевым (строгое равенство)
             if ac['type'] == 'N/A' or not is_target_type(ac['type']):
                 logger.debug(f"Отброшен самолёт {icao} с типом '{ac['type']}' (не целевой)")
                 continue
 
-            # Если тип целевой, добавляем
             processed.append(ac)
             logger.info(f"✅ Целевой самолёт: {icao}, тип '{ac['type']}'")
 

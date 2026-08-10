@@ -53,19 +53,15 @@ class Config:
     DB_RETRY_ATTEMPTS = 3
     DB_RETRY_DELAY = 5
 
-# ---------- Список регионов (для выбора) ----------
+# ---------- ЕДИНСТВЕННЫЙ РЕГИОН (заданный пользователем) ----------
 REGIONS = {
-    "indian_ocean": {"name": "🇮🇳 Индийский океан", "lat_min": -30, "lat_max": 30, "lon_min": 40, "lon_max": 120},
-    "south_china_sea": {"name": "🇨🇳 Южно-Китайское море", "lat_min": 0, "lat_max": 25, "lon_min": 100, "lon_max": 125},
-    "east_china_sea": {"name": "🇨🇳 Восточно-Китайское море", "lat_min": 22, "lat_max": 35, "lon_min": 120, "lon_max": 130},
-    "philippine_sea": {"name": "🇵🇭 Филиппинское море", "lat_min": 10, "lat_max": 30, "lon_min": 125, "lon_max": 140},
-    "japan_sea": {"name": "🇯🇵 Японское море", "lat_min": 33, "lat_max": 50, "lon_min": 125, "lon_max": 140},
-    "yellow_sea": {"name": "🇨🇳 Жёлтое море", "lat_min": 32, "lat_max": 40, "lon_min": 119, "lon_max": 125},
-    "bering_sea": {"name": "🇺🇸 Берингово море", "lat_min": 50, "lat_max": 66, "lon_min": -170, "lon_max": -160},
-    "chukchi_sea": {"name": "🇷🇺 Чукотское море", "lat_min": 66, "lat_max": 75, "lon_min": -180, "lon_max": -160},
-    "australia": {"name": "🇦🇺 Австралия", "lat_min": -40, "lat_max": -10, "lon_min": 110, "lon_max": 155},
-    "pacific_west": {"name": "🌊 Тихий океан (запад)", "lat_min": -60, "lat_max": 70, "lon_min": 130, "lon_max": 180},
-    "pacific_east": {"name": "🌊 Тихий океан (восток)", "lat_min": -60, "lat_max": 70, "lon_min": -180, "lon_max": -120},
+    "pacific": {
+        "name": "🌊 Тихий океан (заданный район)",
+        "lat_min": -46.5,
+        "lat_max": 73.0,
+        "lon_min": 88.46,
+        "lon_max": -154.0   # западная граница (154°W)
+    }
 }
 
 # ---------- Полные словари ----------
@@ -209,13 +205,21 @@ logger = logging.getLogger(__name__)
 
 # ---------- Вспомогательные функции ----------
 def is_in_selected_regions(lat: float, lon: float, selected_regions: Set[str]) -> bool:
-    """Проверяет, находится ли точка в одном из выбранных регионов."""
+    """Проверяет, находится ли точка в одном из выбранных регионов.
+       Поддерживает пересечение через 180-й меридиан (если lon_min > lon_max)."""
     if lat is None or lon is None:
         return False
     for region_key in selected_regions:
         r = REGIONS[region_key]
-        if r["lat_min"] <= lat <= r["lat_max"] and r["lon_min"] <= lon <= r["lon_max"]:
-            return True
+        if r["lat_min"] <= lat <= r["lat_max"]:
+            # Проверка долготы с учётом пересечения через 180°
+            if r["lon_min"] > r["lon_max"]:
+                # Регион пересекает 180-й меридиан
+                if lon >= r["lon_min"] or lon <= r["lon_max"]:
+                    return True
+            else:
+                if r["lon_min"] <= lon <= r["lon_max"]:
+                    return True
     return False
 
 def get_country_by_registration(registration: str) -> str:
@@ -487,18 +491,13 @@ class AircraftTracker:
             logger.error(f"FlightRadarAPI ошибка: {e}")
             return []
 
-    # ---------- Мониторинг (с применением настроек) ----------
+    # ---------- Мониторинг (только целевые типы в заданном регионе) ----------
     async def monitor(self, context: ContextTypes.DEFAULT_TYPE):
         chat_id = context.job.chat_id
         chat_data = context.chat_data
 
-        # Получаем настройки пользователя
-        selected_regions = chat_data.get('selected_regions', set(REGIONS.keys()))
-        filter_mode = chat_data.get('filter_mode', 'targets')  # 'targets' или 'all'
-
-        if not selected_regions:
-            logger.info(f"Чат {chat_id}: нет выбранных регионов, пропускаем")
-            return
+        # Используем всегда только наш регион (pacific)
+        selected_regions = {'pacific'}  # жёстко задано
 
         # Получаем данные из источников
         aircrafts = []
@@ -518,44 +517,28 @@ class AircraftTracker:
 
         # Фильтруем по региону
         region_filtered = [a for a in aircrafts if is_in_selected_regions(a['lat'], a['lon'], selected_regions)]
-        logger.info(f"Чат {chat_id}: {len(aircrafts)} всего, {len(region_filtered)} в регионах")
+        logger.info(f"Чат {chat_id}: {len(aircrafts)} всего, {len(region_filtered)} в регионе")
 
         if not region_filtered:
             return
 
-        # Фильтруем по типу (в зависимости от режима)
-        if filter_mode == 'targets':
-            processed = []
-            for ac in region_filtered:
-                icao = ac['icao']
-                if icao in self.tracked:
-                    continue
-                db_entry = self.db.get(icao)
-                if db_entry:
-                    ac['type'] = db_entry['type']
-                    ac['registration'] = db_entry['registration']
-                else:
-                    ac['type'] = ac.get('type', 'N/A')
-                    ac['registration'] = ac.get('registration', 'N/A')
-                if ac['type'] == 'N/A' or not is_target_type(ac['type']):
-                    continue
-                processed.append(ac)
-        else:  # 'all' — все самолёты
-            processed = []
-            for ac in region_filtered:
-                icao = ac['icao']
-                if icao in self.tracked:
-                    continue
-                db_entry = self.db.get(icao)
-                if db_entry:
-                    ac['type'] = db_entry['type']
-                    ac['registration'] = db_entry['registration']
-                else:
-                    ac['type'] = ac.get('type', 'N/A')
-                    ac['registration'] = ac.get('registration', 'N/A')
-                if ac['type'] == 'N/A':
-                    continue
-                processed.append(ac)
+        # Фильтруем только целевые типы (исключительно по списку TARGET_CODES)
+        processed = []
+        for ac in region_filtered:
+            icao = ac['icao']
+            if icao in self.tracked:
+                continue
+            db_entry = self.db.get(icao)
+            if db_entry:
+                ac['type'] = db_entry['type']
+                ac['registration'] = db_entry['registration']
+            else:
+                ac['type'] = ac.get('type', 'N/A')
+                ac['registration'] = ac.get('registration', 'N/A')
+            # Пропускаем, если тип не определён или не входит в целевой список
+            if ac['type'] == 'N/A' or not is_target_type(ac['type']):
+                continue
+            processed.append(ac)
 
         # Отправляем уведомления
         new_count = 0
@@ -584,8 +567,7 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(
         [
             ["🟢 Запустить мониторинг", "🔴 Остановить"],
-            ["📊 Статус", "🌍 Регионы", "🎯 Режим фильтрации"],
-            ["⚙️ Интервал"]
+            ["📊 Статус", "⚙️ Интервал"]
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -597,105 +579,14 @@ def get_interval_keyboard():
     buttons.append(["🔙 Назад"])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, is_persistent=True)
 
-# ---------- Регионы ----------
-async def regions_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    selected = context.chat_data.get('selected_regions', set(REGIONS.keys()))
-    keyboard = []
-    for key, reg in REGIONS.items():
-        check = "✅" if key in selected else "⬜"
-        keyboard.append([InlineKeyboardButton(f"{check} {reg['name']}", callback_data=f"region_{key}")])
-    keyboard.append([InlineKeyboardButton("🔘 Выбрать все", callback_data="region_all")])
-    keyboard.append([InlineKeyboardButton("🔘 Снять все", callback_data="region_none")])
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="region_back")])
-    await update.message.reply_text(
-        "🌍 *Выберите регионы для отслеживания:*\n"
-        "Нажмите на регион, чтобы включить/выключить.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = update.effective_chat.id
-    data = query.data
-    if data == "region_back":
-        await query.edit_message_text("Главное меню", reply_markup=None)
-        await query.message.reply_text("Главное меню", reply_markup=get_main_keyboard())
-        return
-    selected = set(context.chat_data.get('selected_regions', set(REGIONS.keys())))
-    if data == "region_all":
-        selected = set(REGIONS.keys())
-    elif data == "region_none":
-        selected = set()
-    elif data.startswith("region_"):
-        key = data[7:]
-        if key in selected:
-            selected.remove(key)
-        else:
-            selected.add(key)
-    context.chat_data['selected_regions'] = selected
-    keyboard = []
-    for key, reg in REGIONS.items():
-        check = "✅" if key in selected else "⬜"
-        keyboard.append([InlineKeyboardButton(f"{check} {reg['name']}", callback_data=f"region_{key}")])
-    keyboard.append([InlineKeyboardButton("🔘 Выбрать все", callback_data="region_all")])
-    keyboard.append([InlineKeyboardButton("🔘 Снять все", callback_data="region_none")])
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="region_back")])
-    await query.edit_message_text(
-        "🌍 *Выберите регионы для отслеживания:*\n"
-        "Нажмите на регион, чтобы включить/выключить.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-# ---------- Режим фильтрации ----------
-async def filter_mode_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    current_mode = context.chat_data.get('filter_mode', 'targets')
-    mode_names = {'targets': '🎯 Только целевые', 'all': '✈️ Все самолёты'}
-    keyboard = []
-    for mode, label in mode_names.items():
-        check = "✅" if mode == current_mode else "⬜"
-        keyboard.append([InlineKeyboardButton(f"{check} {label}", callback_data=f"filter_{mode}")])
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="filter_back")])
-    await update.message.reply_text(
-        "🎯 *Режим фильтрации*\n\n"
-        "Выберите, какие самолёты показывать:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-async def filter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    if data == "filter_back":
-        await query.edit_message_text("Главное меню", reply_markup=None)
-        await query.message.reply_text("Главное меню", reply_markup=get_main_keyboard())
-        return
-    if data.startswith("filter_"):
-        mode = data[7:]
-        context.chat_data['filter_mode'] = mode
-        mode_names = {'targets': '🎯 Только целевые', 'all': '✈️ Все самолёты'}
-        await query.edit_message_text(
-            f"✅ Режим изменён на: *{mode_names[mode]}*",
-            parse_mode="Markdown"
-        )
-        await query.message.reply_text("Главное меню", reply_markup=get_main_keyboard())
-
-# ---------- Остальные команды ----------
+# ---------- Старт и статус ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if 'selected_regions' not in context.chat_data:
-        context.chat_data['selected_regions'] = set(REGIONS.keys())
-    if 'filter_mode' not in context.chat_data:
-        context.chat_data['filter_mode'] = 'targets'
+    # Всегда используем только наш регион
+    context.chat_data['selected_regions'] = set(REGIONS.keys())  # {'pacific'}
     await update.message.reply_text(
-        "🛩 *Мульти-трекер с настройками*\n\n"
-        "Вы можете:\n"
-        "• Выбрать регионы для отслеживания\n"
-        "• Включить фильтр только по целевым типам\n"
-        "• Настроить интервал опроса\n\n"
+        "🛩 *Мульти-трекер (только целевые типы)*\n\n"
+        "Отслеживание ведётся в заданном районе Тихого океана.\n"
+        "Фильтр по списку TARGET_CODES включён постоянно.\n\n"
         "Используйте кнопки ниже.",
         parse_mode="Markdown",
         reply_markup=get_main_keyboard()
@@ -705,19 +596,16 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     interval = tracker.get_interval(chat_id)
     is_active = chat_id in tracker.active_chats
-    selected = context.chat_data.get('selected_regions', set())
-    filter_mode = context.chat_data.get('filter_mode', 'targets')
-    mode_names = {'targets': '🎯 Только целевые', 'all': '✈️ Все самолёты'}
-    regions_text = "\n".join([f"• {REGIONS[r]['name']}" for r in selected]) if selected else "❌ Не выбрано"
+    # Показываем информацию о текущем регионе
+    region_name = REGIONS['pacific']['name']
     await update.message.reply_text(
         f"📊 *Статус*\n\n"
         f"🟢 Мониторинг: {'активен' if is_active else 'остановлен'}\n"
         f"⏱ Интервал: {interval} сек.\n"
-        f"🎯 Режим фильтрации: {mode_names[filter_mode]}\n"
-        f"🌍 Выбрано регионов: {len(selected)}\n"
+        f"🌍 Регион: {region_name}\n"
         f"🔍 Отслежено бортов: {len(tracker.tracked)}\n"
         f"⏳ Последнее обновление: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
-        f"Регионы:\n{regions_text}",
+        f"🎯 Фильтр: только целевые типы (TARGET_CODES)",
         parse_mode="Markdown",
         reply_markup=get_main_keyboard()
     )
@@ -857,17 +745,11 @@ def main():
     app.add_handler(MessageHandler(filters.Text("🟢 Запустить мониторинг"), start_monitoring))
     app.add_handler(MessageHandler(filters.Text("🔴 Остановить"), stop_monitoring))
     app.add_handler(MessageHandler(filters.Text("📊 Статус"), status))
-    app.add_handler(MessageHandler(filters.Text("🌍 Регионы"), regions_menu))
-    app.add_handler(MessageHandler(filters.Text("🎯 Режим фильтрации"), filter_mode_menu))
     app.add_handler(MessageHandler(filters.Text("⚙️ Интервал"), interval_settings))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_interval_choice))
     app.add_handler(MessageHandler(filters.ALL, unknown))
 
-    # Callback-запросы
-    app.add_handler(CallbackQueryHandler(region_callback, pattern="^region_"))
-    app.add_handler(CallbackQueryHandler(filter_callback, pattern="^filter_"))
-
-    logger.info("🚀 Бот запущен")
+    logger.info("🚀 Бот запущен (только целевые типы, фиксированный регион)")
     app.run_polling()
 
 if __name__ == "__main__":

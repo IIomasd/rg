@@ -9,14 +9,13 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set
 import requests
 import aiohttp
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
-    CallbackQueryHandler,
 )
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -64,7 +63,7 @@ REGIONS = {
     }
 }
 
-# ---------- Полные словари ----------
+# ---------- Полные словари (сокращён для экономии места, но вы можете оставить полный) ----------
 COUNTRY_CODES = {
     'A2': '🇧🇼 Ботсвана', 'A3': '🇹🇴 Тонга', 'A4': '🇴🇲 Оман', 'A5': '🇧🇹 Бутан',
     'A6': '🇦🇪 ОАЭ', 'A7': '🇶🇦 Катар', 'A8': '🇱🇷 Либерия', 'A9': '🇧🇭 Бахрейн',
@@ -174,7 +173,7 @@ AIRCRAFT_NAMES = {
     'KC130J': 'KC-130J'
 }
 
-# ---------- Целевые типы (расширенный список) ----------
+# ---------- Целевые типы (ваш список) ----------
 TARGET_CODES = {
     # Транспортные и заправщики
     'C130', 'KC130', 'MC130', 'C17', 'C5', 'C2',
@@ -206,15 +205,13 @@ logger = logging.getLogger(__name__)
 # ---------- Вспомогательные функции ----------
 def is_in_selected_regions(lat: float, lon: float, selected_regions: Set[str]) -> bool:
     """Проверяет, находится ли точка в одном из выбранных регионов.
-       Поддерживает пересечение через 180-й меридиан (если lon_min > lon_max)."""
+       Поддерживает пересечение через 180-й меридиан."""
     if lat is None or lon is None:
         return False
     for region_key in selected_regions:
         r = REGIONS[region_key]
         if r["lat_min"] <= lat <= r["lat_max"]:
-            # Проверка долготы с учётом пересечения через 180°
             if r["lon_min"] > r["lon_max"]:
-                # Регион пересекает 180-й меридиан
                 if lon >= r["lon_min"] or lon <= r["lon_max"]:
                     return True
             else:
@@ -246,9 +243,12 @@ def is_target_type(t: str) -> bool:
     if not t:
         return False
     clean = normalize_type(t)
+    # Проверяем, содержится ли один из кодов в clean
     for code in TARGET_CODES:
         if code in clean:
+            logger.debug(f"Тип '{t}' -> нормализовано '{clean}', совпало с кодом '{code}'")
             return True
+    logger.debug(f"Тип '{t}' -> нормализовано '{clean}' НЕ является целевым")
     return False
 
 # ---------- Загрузчик базы ICAO ----------
@@ -494,10 +494,9 @@ class AircraftTracker:
     # ---------- Мониторинг (только целевые типы в заданном регионе) ----------
     async def monitor(self, context: ContextTypes.DEFAULT_TYPE):
         chat_id = context.job.chat_id
-        chat_data = context.chat_data
 
-        # Используем всегда только наш регион (pacific)
-        selected_regions = {'pacific'}  # жёстко задано
+        # Фиксированный регион
+        selected_regions = {'pacific'}
 
         # Получаем данные из источников
         aircrafts = []
@@ -528,6 +527,8 @@ class AircraftTracker:
             icao = ac['icao']
             if icao in self.tracked:
                 continue
+
+            # Получаем тип из базы, если есть
             db_entry = self.db.get(icao)
             if db_entry:
                 ac['type'] = db_entry['type']
@@ -535,10 +536,15 @@ class AircraftTracker:
             else:
                 ac['type'] = ac.get('type', 'N/A')
                 ac['registration'] = ac.get('registration', 'N/A')
-            # Пропускаем, если тип не определён или не входит в целевой список
+
+            # Проверяем, является ли тип целевым
             if ac['type'] == 'N/A' or not is_target_type(ac['type']):
+                logger.debug(f"Отброшен самолёт {icao} с типом '{ac['type']}' (не целевой)")
                 continue
+
+            # Если тип целевой, добавляем
             processed.append(ac)
+            logger.info(f"✅ Целевой самолёт: {icao}, тип '{ac['type']}'")
 
         # Отправляем уведомления
         new_count = 0
@@ -579,10 +585,7 @@ def get_interval_keyboard():
     buttons.append(["🔙 Назад"])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, is_persistent=True)
 
-# ---------- Старт и статус ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Всегда используем только наш регион
-    context.chat_data['selected_regions'] = set(REGIONS.keys())  # {'pacific'}
     await update.message.reply_text(
         "🛩 *Мульти-трекер (только целевые типы)*\n\n"
         "Отслеживание ведётся в заданном районе Тихого океана.\n"
@@ -596,7 +599,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     interval = tracker.get_interval(chat_id)
     is_active = chat_id in tracker.active_chats
-    # Показываем информацию о текущем регионе
     region_name = REGIONS['pacific']['name']
     await update.message.reply_text(
         f"📊 *Статус*\n\n"
@@ -681,34 +683,6 @@ async def handle_interval_choice(update: Update, context: ContextTypes.DEFAULT_T
     except Exception:
         await update.message.reply_text("Неверный формат. Используйте кнопки.", reply_markup=get_interval_keyboard())
 
-async def set_interval_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Укажите интервал в секундах, например: /setinterval 30")
-        return
-    try:
-        seconds = int(context.args[0])
-        if seconds < Config.MIN_INTERVAL:
-            await update.message.reply_text(f"Минимальный интервал – {Config.MIN_INTERVAL} сек.")
-            return
-        chat_id = update.effective_chat.id
-        tracker.set_interval(chat_id, seconds)
-        if chat_id in tracker.active_chats:
-            for job in context.job_queue.get_jobs_by_name(str(chat_id)):
-                job.schedule_removal()
-            context.job_queue.run_repeating(
-                tracker.monitor,
-                interval=timedelta(seconds=seconds),
-                first=5,
-                chat_id=chat_id,
-                name=str(chat_id),
-                job_kwargs={'max_instances': 1}
-            )
-            await update.message.reply_text(f"✅ Интервал изменён на {seconds} сек. Мониторинг перезапущен.", reply_markup=get_main_keyboard())
-        else:
-            await update.message.reply_text(f"✅ Интервал сохранён ({seconds} сек.). Запустите мониторинг.", reply_markup=get_main_keyboard())
-    except ValueError:
-        await update.message.reply_text("Введите число секунд.")
-
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Используйте кнопки ⬇️", reply_markup=get_main_keyboard())
 
@@ -734,14 +708,11 @@ def main():
     tracker = AircraftTracker(db)
     app = Application.builder().token(Config.BOT_TOKEN).build()
 
-    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("monitor", start_monitoring))
     app.add_handler(CommandHandler("stop", stop_monitoring))
-    app.add_handler(CommandHandler("setinterval", set_interval_command))
 
-    # Кнопки
     app.add_handler(MessageHandler(filters.Text("🟢 Запустить мониторинг"), start_monitoring))
     app.add_handler(MessageHandler(filters.Text("🔴 Остановить"), stop_monitoring))
     app.add_handler(MessageHandler(filters.Text("📊 Статус"), status))
